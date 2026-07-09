@@ -77,19 +77,18 @@ curl -X POST \
 
 The API returns a PNG-formatted upscaled image.
 
-### Optional Parameters
+### Optional Query Parameters
 
-You can adjust upscale factor:
+You can adjust the upscale factor with the `outscale` query parameter. The default is **2×**.
+
+You can also adjust Real-ESRGAN tiling with the `tile` query parameter. The default is **512**. Lowering the tile size (for example, `256`) can reduce CUDA out-of-memory risk on large images. Set `tile=0` only when you want to disable tiling; large images may OOM without tiling.
 
 ```sh
 curl -X POST \
+     "http://localhost:8000/upscale/?outscale=3.75&tile=512" \
      -F "file=@input.jpg" \
-     -F "outscale=4" \
-     -o output.png \
-     http://localhost:8000/upscale/
+     -o output.png
 ```
-
-Default is **2×**.
 
 ---
 
