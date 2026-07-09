@@ -1,3 +1,4 @@
+import asyncio
 import gc
 import io
 
@@ -5,13 +6,15 @@ import cv2
 import numpy as np
 import torch
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
 
 app = FastAPI()
+
+DEFAULT_TILE = 512
 
 # ---------------- Real-ESRGAN setup ----------------
 
@@ -33,12 +36,14 @@ upsampler = RealESRGANer(
     scale=4,
     model_path=model_path,
     model=model,
-    tile=0,
+    tile=DEFAULT_TILE,
     tile_pad=10,
     pre_pad=0,
     half=(device.type == "cuda"),  # use half precision on GPU
     device=device,
 )
+
+upsampler_lock = asyncio.Lock()
 
 # ---------------- API endpoint ----------------
 
@@ -46,6 +51,11 @@ upsampler = RealESRGANer(
 async def upscale_image(
     file: UploadFile = File(...),
     outscale: float = 2.0,  # default 2x; you can send 4.0, etc.
+    tile: int = Query(
+        DEFAULT_TILE,
+        ge=0,
+        description="Real-ESRGAN tile size. Use 0 to disable tiling.",
+    ),
 ):
     data = None
     nparr = None
@@ -64,9 +74,17 @@ async def upscale_image(
         if img is None:
             raise HTTPException(status_code=400, detail="Could not decode image")
 
-        # Run Real-ESRGAN without autograd graph allocation
-        with torch.inference_mode():
-            output, _ = upsampler.enhance(img, outscale=outscale)
+        # Run Real-ESRGAN without autograd graph allocation.
+        # RealESRGANer stores tile size on the instance, so protect per-request
+        # tile changes from concurrent requests sharing the global upsampler.
+        async with upsampler_lock:
+            previous_tile = upsampler.tile
+            upsampler.tile = tile
+            try:
+                with torch.inference_mode():
+                    output, _ = upsampler.enhance(img, outscale=outscale)
+            finally:
+                upsampler.tile = previous_tile
 
         # Encode result to PNG bytes
         ok, buf = cv2.imencode(".png", output)
