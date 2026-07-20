@@ -37,14 +37,19 @@ RUN git clone --depth 1 https://github.com/xinntao/Real-ESRGAN.git && \
 # 6. Install Real-ESRGAN deps, but prevent it from overwriting torch / opencv
 WORKDIR /Real-ESRGAN
 
+#   - use a temporary C toolchain for source-built dependencies such as lmdb
 #   - remove any torch + opencv-python lines from its requirements
-RUN sed -i '/torch/d' requirements.txt && \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    sed -i '/torch/d' requirements.txt && \
     sed -i '/opencv-python/d' requirements.txt && \
     pip install --no-cache-dir basicsr==1.4.2 facexlib==0.2.5 gfpgan==1.3.8 && \
     pip install --no-cache-dir -r requirements.txt && \
     # install headless OpenCV explicitly
     pip install --no-cache-dir opencv-python-headless && \
-    python setup.py develop
+    python setup.py develop && \
+    apt-get purge -y --auto-remove build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
 # 7. Copy API code into /app and set workdir back
 WORKDIR /app
