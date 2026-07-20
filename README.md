@@ -154,6 +154,10 @@ This avoids issues with deleted temp files and is much faster.
 
 ### Troubleshooting (Docker GPU)
 
+If an `lmdb` build reports `gcc: No such file or directory`, update to current
+main and rebuild the image. The Docker build now installs a temporary C
+toolchain for source-built dependencies and removes it after installation.
+
 If `torch.cuda.is_available()` is `False` in-container:
 
 1. Verify host GPU runtime works:
