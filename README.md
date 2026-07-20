@@ -36,6 +36,12 @@ Run the container:
 docker run -d --gpus all -p 8000:8000 --name realesrgan real-esrgan-api
 ```
 
+To start with the anime model instead:
+
+```sh
+docker run -e REALESRGAN_MODEL=RealESRGAN_x4plus_anime_6B -d --gpus all -p 8000:8000 --name realesrgan real-esrgan-api
+```
+
 ### ▶️ Or Use Docker Compose
 
 This repo ships with `compose.yml` configured for GPU (`gpus: all`).
@@ -45,6 +51,28 @@ docker compose up -d --build
 ```
 
 This will start the API and expose it on **http://localhost:8000**.
+
+Select the anime model for Compose at startup with:
+
+```sh
+REALESRGAN_MODEL=RealESRGAN_x4plus_anime_6B docker compose up -d
+```
+
+### Model selection
+
+`REALESRGAN_MODEL` selects the one model loaded for the lifetime of the API process.
+The supported canonical values are:
+
+- `RealESRGAN_x4plus` (standard, 23-block model; the default when unset or blank)
+- `RealESRGAN_x4plus_anime_6B` (Anime 6B model)
+
+The exact friendly alias `Real-ESRGAN Anime 6B` is also accepted for the anime
+model. Matching is case-insensitive and ignores surrounding whitespace. Other
+values fail startup instead of falling back to a different model.
+
+Both official weight files are embedded in the image, so runtime startup does
+not download weights. Rebuild the image after updating from a version that did
+not include both weights.
 
 ### ✅ Verify GPU is visible inside the container
 
@@ -76,6 +104,19 @@ curl -X POST \
 ```
 
 The API returns a PNG-formatted upscaled image.
+
+### Health endpoint
+
+`GET /health` reports readiness, the canonical active model, and whether the
+process selected CPU or CUDA, without exposing the model weight path:
+
+```json
+{
+  "status": "ok",
+  "model": "RealESRGAN_x4plus_anime_6B",
+  "device": "cuda"
+}
+```
 
 ### Optional Query Parameters
 

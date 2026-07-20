@@ -30,7 +30,9 @@ WORKDIR /
 RUN git clone --depth 1 https://github.com/xinntao/Real-ESRGAN.git && \
     mkdir -p /Real-ESRGAN/weights && \
     wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth \
-         -O /Real-ESRGAN/weights/RealESRGAN_x4plus.pth
+         -O /Real-ESRGAN/weights/RealESRGAN_x4plus.pth && \
+    wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth \
+         -O /Real-ESRGAN/weights/RealESRGAN_x4plus_anime_6B.pth
 
 # 6. Install Real-ESRGAN deps, but prevent it from overwriting torch / opencv
 WORKDIR /Real-ESRGAN

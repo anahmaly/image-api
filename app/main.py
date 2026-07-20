@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import io
+import os
 
 import cv2
 import numpy as np
@@ -12,6 +13,8 @@ from fastapi.responses import StreamingResponse
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
 
+from model_config import resolve_model
+
 app = FastAPI()
 
 DEFAULT_TILE = 512
@@ -20,21 +23,20 @@ DEFAULT_TILE = 512
 
 # Pick device based on CUDA availability
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+selected_model = resolve_model(os.getenv("REALESRGAN_MODEL"))
 
 model = RRDBNet(
     num_in_ch=3,
     num_out_ch=3,
     num_feat=64,
-    num_block=23,
+    num_block=selected_model.num_block,
     num_grow_ch=32,
-    scale=4,
+    scale=selected_model.network_scale,
 )
 
-model_path = "/Real-ESRGAN/weights/RealESRGAN_x4plus.pth"
-
 upsampler = RealESRGANer(
-    scale=4,
-    model_path=model_path,
+    scale=selected_model.network_scale,
+    model_path=selected_model.model_path,
     model=model,
     tile=DEFAULT_TILE,
     tile_pad=10,
@@ -46,6 +48,15 @@ upsampler = RealESRGANer(
 upsampler_lock = asyncio.Lock()
 
 # ---------------- API endpoint ----------------
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model": selected_model.canonical_name,
+        "device": device.type,
+    }
+
 
 @app.post("/upscale/")
 async def upscale_image(
