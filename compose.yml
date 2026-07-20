@@ -6,6 +6,8 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
+    environment:
+      REALESRGAN_MODEL: ${REALESRGAN_MODEL:-RealESRGAN_x4plus}
     restart: unless-stopped
 
     # GPU support (equivalent to --gpus all)
