@@ -88,6 +88,42 @@ All repository-owned configuration uses the `IMAGE_API_` prefix. Important bound
 
 Bind defaults to `0.0.0.0:8000`; restrict access with the host firewall to trusted LAN devices.
 
+## Operator convenience scripts
+
+Both scripts resolve the repository root from their own location, so they can be invoked from any working directory.
+
+Rebuild all production images, pulling updated base images by default:
+
+```sh
+./scripts/rebuild-images.sh
+```
+
+Arguments are forwarded after `docker compose build --pull`, so Compose build flags and service selection remain available:
+
+```sh
+# Rebuild only the background worker and gateway.
+./scripts/rebuild-images.sh background-worker image-api
+
+# Rebuild all production images without the build cache.
+./scripts/rebuild-images.sh --no-cache
+```
+
+The rebuild script validates `compose.yml` first and never starts, stops, or recreates containers.
+
+Start the existing production images with Compose GPU reservations, wait for all four services to become healthy, verify CUDA in every GPU worker, and validate the published gateway `/health` response:
+
+```sh
+./scripts/run-gpu.sh
+```
+
+The operational startup wait defaults to 300 seconds. Override it with a strict positive integer when mounted models or host startup require more time:
+
+```sh
+IMAGE_API_STARTUP_TIMEOUT_SECONDS=600 ./scripts/run-gpu.sh
+```
+
+`run-gpu.sh` uses only `compose.yml` and runs `docker compose up -d` without rebuilding. On failure it prints Compose status and bounded recent logs without tearing the stack down. The scripts do not download weights, run inference, or deploy beyond starting the local Compose project. All licensed model mounts must already be present for `/health` to report the aggregate `status: ok` required by `run-gpu.sh`.
+
 ## Compose
 
 Validate production configuration:
