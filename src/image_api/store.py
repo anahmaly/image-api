@@ -135,6 +135,26 @@ class TaskStore:
         with self._connect() as connection:
             return int(connection.execute("SELECT COUNT(*) FROM generation_tasks").fetchone()[0])
 
+    def source_referenced(self, source_name: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT 1 FROM generation_tasks
+                   WHERE status IN ('queued','running')
+                     AND json_extract(request_json, '$.source_image_name') = ? LIMIT 1""",
+                (source_name,),
+            ).fetchone()
+        return row is not None
+
+    def active_source_names(self) -> set[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT json_extract(request_json, '$.source_image_name') AS source_name
+                   FROM generation_tasks
+                   WHERE status IN ('queued','running')
+                     AND json_type(request_json, '$.source_image_name') = 'text'"""
+            ).fetchall()
+        return {str(row["source_name"]) for row in rows}
+
     def claim_next(self, worker_id: str) -> TaskRecord | None:
         now = time.time_ns()
         with self._connect() as connection:
