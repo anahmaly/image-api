@@ -123,18 +123,46 @@ verify_cuda() {
 }
 
 validate_gateway_health() {
-    local published_address port health_url
+    local published_address health_url mapping_for_error
     if ! published_address="$("${COMPOSE[@]}" port image-api 8000)"; then
         fail 'could not resolve the published image-api port'
         return 1
     fi
-    published_address="${published_address%%$'\n'*}"
-    port="${published_address##*:}"
-    if [[ ! "$port" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
-        fail "docker compose returned an invalid image-api port mapping: $published_address"
+    if ! health_url="$(python3 - "$published_address" <<'PY'
+import ipaddress
+import re
+import sys
+
+mapping = sys.argv[1]
+if not mapping or "\n" in mapping or "\r" in mapping:
+    raise SystemExit(1)
+
+bracketed = re.fullmatch(r"\[([0-9A-Fa-f:.]+)\]:([0-9]+)", mapping)
+ipv4 = re.fullmatch(r"([0-9.]+):([0-9]+)", mapping)
+try:
+    if bracketed:
+        host, port_text = bracketed.groups()
+        address = ipaddress.IPv6Address(host)
+        url_host = "[::1]" if address.is_unspecified else f"[{host}]"
+    elif ipv4:
+        host, port_text = ipv4.groups()
+        address = ipaddress.IPv4Address(host)
+        url_host = "127.0.0.1" if address.is_unspecified else host
+    else:
+        raise ValueError("unsupported mapping syntax")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValueError("port out of range")
+except ValueError as exc:
+    raise SystemExit(1) from exc
+
+print(f"http://{url_host}:{port}/health")
+PY
+    )"; then
+        printf -v mapping_for_error '%q' "$published_address"
+        fail "docker compose returned an invalid image-api port mapping: $mapping_for_error"
         return 1
     fi
-    health_url="http://127.0.0.1:${port}/health"
     printf 'Querying gateway health at %s (published mapping: %s)\n' "$health_url" "$published_address"
     if ! health_file="$(mktemp)"; then
         fail 'could not create a temporary file for the gateway health response'

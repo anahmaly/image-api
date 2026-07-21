@@ -74,7 +74,11 @@ if [[ "$1" == "compose" ]]; then
       printf 'Fake GPU %s\\n' "$service"
       exit 0
       ;;
-    port) [[ "$2" == "image-api" && "$3" == "8000" ]] || exit 94; printf '0.0.0.0:19000\\n'; exit 0 ;;
+    port)
+      [[ "$2" == "image-api" && "$3" == "8000" ]] || exit 94
+      printf '%s\\n' "${FAKE_PORT_MAPPING-0.0.0.0:19000}"
+      exit 0
+      ;;
     logs) exit 0 ;;
   esac
 elif [[ "$1" == "inspect" ]]; then
@@ -184,6 +188,57 @@ def test_run_starts_only_production_stack_and_verifies_every_contract(tmp_path: 
     assert "GPU worker generation-worker CUDA devices: Fake GPU generation-worker" in result.stdout
     assert "Gateway health contract verified" in result.stdout
     assert not any(" down" in call for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("mapping", "expected_url"),
+    [
+        ("0.0.0.0:19000", "http://127.0.0.1:19000/health"),
+        ("127.0.0.1:19001", "http://127.0.0.1:19001/health"),
+        ("192.0.2.25:19002", "http://192.0.2.25:19002/health"),
+        ("[::]:19003", "http://[::1]:19003/health"),
+        ("[::1]:19004", "http://[::1]:19004/health"),
+        ("[2001:db8::25]:19005", "http://[2001:db8::25]:19005/health"),
+    ],
+)
+def test_run_uses_valid_compose_mapping_host_in_exact_curl_url(
+    tmp_path: Path, mapping: str, expected_url: str
+) -> None:
+    env, log = _fake_environment(tmp_path, FAKE_PORT_MAPPING=mapping)
+    result = _run(SCRIPTS[1], env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    curl_calls = [line for line in log.read_text().splitlines() if "|curl " in line]
+    assert len(curl_calls) == 1
+    assert curl_calls[0].split()[-1] == expected_url
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        "",
+        "not-a-mapping",
+        "0.0.0.0:",
+        ":8000",
+        "0.0.0.0:not-a-port",
+        "0.0.0.0:0",
+        "0.0.0.0:65536",
+        "0.0.0.0:8000\n127.0.0.1:8001",
+        "::1:8000",
+        "[::1]8000",
+        "[not-ipv6]:8000",
+        "127.0.0.1@attacker:8000",
+        "[::1]@attacker:8000",
+    ],
+)
+def test_run_rejects_invalid_or_ambiguous_compose_mapping(tmp_path: Path, mapping: str) -> None:
+    env, log = _fake_environment(tmp_path, FAKE_PORT_MAPPING=mapping)
+    result = _run(SCRIPTS[1], env, tmp_path)
+
+    assert result.returncode != 0
+    assert "invalid image-api port mapping" in result.stderr
+    assert "|curl " not in log.read_text()
+    assert "docker compose -f compose.yml ps" in log.read_text()
 
 
 @pytest.mark.parametrize(
