@@ -51,6 +51,14 @@ def test_only_gateway_publishes_ports() -> None:
     assert len(port_lines) == 1
 
 
+def test_compose_has_no_legacy_background_model_mount_contract() -> None:
+    compose = (ROOT / "compose.yml").read_text()
+    assert "/models/rembg" not in compose
+    assert "IMAGE_API_REMBG_MODELS_PATH" not in compose
+    assert "IMAGE_API_REMBG_WEIGHTS_PATH" not in compose
+    assert "IMAGE_API_REMBG_WEIGHTS_HOST_PATH" not in compose
+
+
 def test_pinned_upstream_sources_and_no_weight_download_commands() -> None:
     text = repository_text()
     assert "dd7b6fd434cff2077ce6e9a0cab46fe254f26f1f" in text

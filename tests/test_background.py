@@ -48,10 +48,14 @@ def test_background_options_are_bounded_before_dispatch(setup) -> None:
     assert worker.model_invocations == 0
 
 
-def test_unknown_background_model_is_rejected(setup) -> None:
+@pytest.mark.parametrize(
+    "model",
+    ["isnet-general-use", "u2net", "u2netp", "isnet-anime", "silueta"],
+)
+def test_removed_background_model_is_rejected_before_worker(setup, model: str) -> None:
     client, worker = setup
     response = client.post(
-        "/v1/background-removal?model=not-real",
+        f"/v1/background-removal?model={model}",
         files={"file": ("input.png", png(), "image/png")},
     )
     assert response.status_code == 422

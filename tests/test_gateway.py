@@ -37,6 +37,11 @@ def test_health_and_models_do_not_load_models(client: TestClient, worker: FakeWo
         "background-removal",
         "generation",
     }
+    assert [
+        item["model"]
+        for item in models.json()["models"]
+        if item["capability"] == "background-removal"
+    ] == ["bria-rmbg-2.0", "birefnet-hr-matting"]
     assert worker.model_invocations == 0
     assert worker.model_loads == 0
     assert "/models/" not in health.text + models.text

@@ -3,13 +3,16 @@ from __future__ import annotations
 import sys
 from io import BytesIO
 from types import ModuleType, SimpleNamespace
+from typing import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
 from helpers import png
-from image_api_workers.background import app
+from image_api_workers import background
+
+app = background.app
 
 
 def _install_pr7_fakes(monkeypatch, calls: list[tuple[str, dict[str, object]]]) -> None:
@@ -25,6 +28,7 @@ def _install_pr7_fakes(monkeypatch, calls: list[tuple[str, dict[str, object]]]) 
         return png("RGBA", (13, 7))
 
     birefnet.remove_with_birefnet = remove_with_birefnet
+    setattr(birefnet, "clear_cache", lambda: calls.append(("clear-birefnet", {})))
 
     bria = ModuleType("rembg_api.bria_rmbg")
 
@@ -33,6 +37,7 @@ def _install_pr7_fakes(monkeypatch, calls: list[tuple[str, dict[str, object]]]) 
         return png("RGBA", (13, 7))
 
     bria.remove_with_bria_rmbg_2 = remove_with_bria
+    setattr(bria, "clear_bria_backend_cache", lambda **kwargs: calls.append(("clear-bria", kwargs)))
 
     processing = ModuleType("rembg_api.image_processing")
     processing.AlphaOptions = lambda **kwargs: SimpleNamespace(**kwargs)
@@ -43,6 +48,56 @@ def _install_pr7_fakes(monkeypatch, calls: list[tuple[str, dict[str, object]]]) 
     monkeypatch.setitem(sys.modules, "rembg_api.birefnet_hr", birefnet)
     monkeypatch.setitem(sys.modules, "rembg_api.bria_rmbg", bria)
     monkeypatch.setitem(sys.modules, "rembg_api.image_processing", processing)
+
+
+@pytest.fixture(autouse=True)
+def reset_active_background_model() -> Iterator[None]:
+    background._active_model = None
+    yield
+    background._active_model = None
+
+
+def _install_cuda_fake(monkeypatch) -> None:
+    torch = ModuleType("torch")
+    torch.cuda = SimpleNamespace(is_available=lambda: True)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+
+def test_health_is_ready_with_only_bria_and_birefnet_mounts(monkeypatch, tmp_path) -> None:
+    bria = tmp_path / "bria"
+    birefnet = tmp_path / "birefnet"
+    bria.mkdir()
+    birefnet.mkdir()
+    monkeypatch.setenv("IMAGE_API_BRIA_WEIGHTS_PATH", str(bria))
+    monkeypatch.setenv("IMAGE_API_BIREFNET_WEIGHTS_PATH", str(birefnet))
+    monkeypatch.setenv("IMAGE_API_REMBG_WEIGHTS_PATH", str(tmp_path / "absent-legacy-models"))
+    assert not (tmp_path / "absent-legacy-models").exists()
+    _install_cuda_fake(monkeypatch)
+
+    health = background._health()
+
+    assert health["ready"] is True
+    assert health["weightsAvailable"] is True
+
+
+@pytest.mark.parametrize("missing", ["bria", "birefnet"])
+def test_health_is_not_ready_when_a_remaining_mount_is_absent(
+    monkeypatch, tmp_path, missing: str
+) -> None:
+    bria = tmp_path / "bria"
+    birefnet = tmp_path / "birefnet"
+    if missing != "bria":
+        bria.mkdir()
+    if missing != "birefnet":
+        birefnet.mkdir()
+    monkeypatch.setenv("IMAGE_API_BRIA_WEIGHTS_PATH", str(bria))
+    monkeypatch.setenv("IMAGE_API_BIREFNET_WEIGHTS_PATH", str(birefnet))
+    _install_cuda_fake(monkeypatch)
+
+    health = background._health()
+
+    assert health["ready"] is False
+    assert health["weightsAvailable"] is False
 
 
 @pytest.mark.parametrize(
@@ -85,3 +140,24 @@ def test_pr7_backends_dispatch_with_bounded_options_and_rgba(
         assert image.format == "PNG"
         assert image.mode == "RGBA"
         assert image.size == (13, 7)
+
+
+def test_switching_remaining_models_releases_resident_model(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("IMAGE_API_STATE_DIR", str(tmp_path))
+    calls: list[tuple[str, dict[str, object]]] = []
+    _install_pr7_fakes(monkeypatch, calls)
+    client = TestClient(app)
+
+    for model in ("bria-rmbg-2.0", "birefnet-hr-matting"):
+        response = client.post(
+            f"/internal/background-removal?model={model}",
+            files={"file": ("input.png", png("RGB", (13, 7)), "image/png")},
+        )
+        assert response.status_code == 200
+
+    assert [name for name, _ in calls] == [
+        "bria",
+        "clear-birefnet",
+        "clear-bria",
+        "birefnet",
+    ]

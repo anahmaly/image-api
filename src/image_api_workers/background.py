@@ -5,7 +5,6 @@ import gc
 import io
 import logging
 import os
-from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -16,8 +15,6 @@ from PIL import Image
 from image_api_workers.execution import execute_in_gpu_lane
 
 logger = logging.getLogger(__name__)
-REMBG_MODELS = ("isnet-general-use", "u2net", "u2netp", "isnet-anime", "silueta")
-REMBG_FILES = {model: f"{model}.onnx" for model in REMBG_MODELS}
 _active_model: str | None = None
 
 
@@ -38,21 +35,8 @@ def _birefnet_config() -> Any:
     )
 
 
-@lru_cache(maxsize=len(REMBG_MODELS))
-def _rembg_session(model: str) -> Any:
-    from rembg import new_session
-
-    weights = Path(os.getenv("IMAGE_API_REMBG_WEIGHTS_PATH", "/models/rembg"))
-    expected = weights / REMBG_FILES[model]
-    if not expected.is_file():
-        raise FileNotFoundError("configured rembg model mount is unavailable")
-    os.environ["U2NET_HOME"] = str(weights)
-    return new_session(model)
-
-
 def _release_resident_models() -> None:
     global _active_model
-    _rembg_session.cache_clear()
     try:
         from rembg_api.birefnet_hr import clear_cache
 
@@ -111,9 +95,7 @@ def _run_background(
             model_path=os.getenv("IMAGE_API_BRIA_WEIGHTS_PATH", "/models/bria-rmbg-2.0"),
         )
     else:
-        from rembg import remove
-
-        removed = remove(data, session=_rembg_session(model))
+        raise ValueError("unsupported background-removal model")
     if not isinstance(removed, bytes):
         raise RuntimeError("background backend returned invalid bytes")
     from rembg_api.image_processing import AlphaOptions, DespillOptions, process_png_bytes
@@ -147,7 +129,6 @@ def _run_background(
 def _health() -> dict[str, object]:
     bria = Path(os.getenv("IMAGE_API_BRIA_WEIGHTS_PATH", "/models/bria-rmbg-2.0"))
     birefnet = Path(os.getenv("IMAGE_API_BIREFNET_WEIGHTS_PATH", "/models/birefnet-hr"))
-    rembg = Path(os.getenv("IMAGE_API_REMBG_WEIGHTS_PATH", "/models/rembg"))
     try:
         import torch
 
@@ -155,11 +136,7 @@ def _health() -> dict[str, object]:
     except Exception:
         cuda = False
     loaded = _active_model is not None
-    mounts = (
-        bria.is_dir()
-        and birefnet.is_dir()
-        and all((rembg / filename).is_file() for filename in REMBG_FILES.values())
-    )
+    mounts = bria.is_dir() and birefnet.is_dir()
     return {
         "ready": cuda and mounts,
         "loaded": bool(loaded),
@@ -181,15 +158,7 @@ def health() -> dict[str, object]:
 async def remove_background(
     file: Annotated[UploadFile, File()],
     model: Annotated[
-        Literal[
-            "isnet-general-use",
-            "u2net",
-            "u2netp",
-            "isnet-anime",
-            "silueta",
-            "bria-rmbg-2.0",
-            "birefnet-hr-matting",
-        ],
+        Literal["bria-rmbg-2.0", "birefnet-hr-matting"],
         Query(),
     ],
     alpha_blur: Annotated[float, Query(ge=0, le=20)] = 0,
