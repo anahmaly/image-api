@@ -1,21 +1,128 @@
+name: image-api
+
 services:
-  realesrgan:
-    container_name: realesrgan
+  image-api:
+    image: image-api-gateway:local
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.gateway
     ports:
-      - "8000:8000"
+      - "${IMAGE_API_BIND_ADDRESS:-0.0.0.0}:${IMAGE_API_PORT:-8000}:8000"
     environment:
-      REALESRGAN_MODEL: ${REALESRGAN_MODEL:-RealESRGAN_x4plus}
+      IMAGE_API_STATE_DIR: /state
+      IMAGE_API_UPSCALE_WORKER_URL: http://upscale-worker:9001
+      IMAGE_API_BACKGROUND_WORKER_URL: http://background-worker:9002
+      IMAGE_API_IDEOGRAM_WEIGHTS_PATH: /models/ideogram-4-nf4
+      IMAGE_API_CUDA_AVAILABLE: "true"
+      IMAGE_API_MAX_REQUEST_BYTES: ${IMAGE_API_MAX_REQUEST_BYTES:-21000000}
+      IMAGE_API_MAX_UPLOAD_BYTES: ${IMAGE_API_MAX_UPLOAD_BYTES:-20000000}
+      IMAGE_API_MAX_INPUT_PIXELS: ${IMAGE_API_MAX_INPUT_PIXELS:-40000000}
+      IMAGE_API_MAX_OUTPUT_PIXELS: ${IMAGE_API_MAX_OUTPUT_PIXELS:-80000000}
+      IMAGE_API_MAX_QUEUE_DEPTH: ${IMAGE_API_MAX_QUEUE_DEPTH:-100}
+      IMAGE_API_MAGIC_PROMPT_BACKEND: ${IMAGE_API_MAGIC_PROMPT_BACKEND:-}
+    volumes:
+      - image-api-state:/state
+      - ${IMAGE_API_IDEOGRAM_WEIGHTS_HOST_PATH:-./models/ideogram-4-nf4}:/models/ideogram-4-nf4:ro
+    depends_on:
+      upscale-worker:
+        condition: service_healthy
+      background-worker:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
-    # GPU support (equivalent to --gpus all)
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
-
-    # If your Docker Compose version supports the `gpus:` key directly (Compose v2+)
+  upscale-worker:
+    image: image-api-upscale-worker:local
+    build:
+      context: .
+      dockerfile: Dockerfile.upscale
+    expose:
+      - "9001"
+    environment:
+      IMAGE_API_UPSCALE_WEIGHTS_PATH: /models/upscale
+    volumes:
+      - ${IMAGE_API_UPSCALE_WEIGHTS_HOST_PATH:-./models/upscale}:/models/upscale:ro
+      - image-api-state:/state
     gpus: all
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9001/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  background-worker:
+    image: image-api-background-worker:local
+    build:
+      context: .
+      dockerfile: Dockerfile.background
+    expose:
+      - "9002"
+    environment:
+      IMAGE_API_REMBG_WEIGHTS_PATH: /models/rembg
+      IMAGE_API_BRIA_WEIGHTS_PATH: /models/bria-rmbg-2.0
+      IMAGE_API_BIREFNET_WEIGHTS_PATH: /models/birefnet-hr
+      IMAGE_API_BIREFNET_REVISION: 5d6b6f8adcb5b417c871b1d84ceaae9871355b7f
+    volumes:
+      - ${IMAGE_API_REMBG_WEIGHTS_HOST_PATH:-./models/rembg}:/models/rembg:ro
+      - ${IMAGE_API_BRIA_WEIGHTS_HOST_PATH:-./models/bria-rmbg-2.0}:/models/bria-rmbg-2.0:ro
+      - ${IMAGE_API_BIREFNET_WEIGHTS_HOST_PATH:-./models/birefnet-hr}:/models/birefnet-hr:ro
+      - image-api-state:/state
+    gpus: all
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9002/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  generation-worker:
+    image: image-api-generation-worker:local
+    build:
+      context: .
+      dockerfile: Dockerfile.generation
+    environment:
+      IMAGE_API_STATE_DIR: /state
+      IMAGE_API_IDEOGRAM_WEIGHTS_PATH: /models/ideogram-4-nf4
+      IMAGE_API_IDEOGRAM_REPOSITORY_ID: ideogram-ai/ideogram-4-nf4
+      IMAGE_API_MAX_QUEUE_DEPTH: ${IMAGE_API_MAX_QUEUE_DEPTH:-100}
+      IMAGE_API_MAGIC_PROMPT_BACKEND: ${IMAGE_API_MAGIC_PROMPT_BACKEND:-}
+      IMAGE_API_MAGIC_PROMPT_API_KEY: ${IMAGE_API_MAGIC_PROMPT_API_KEY:-}
+    volumes:
+      - image-api-state:/state
+      - ${IMAGE_API_IDEOGRAM_WEIGHTS_HOST_PATH:-./models/ideogram-4-nf4}:/models/ideogram-4-nf4:ro
+    gpus: all
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,time; age=time.time()-os.path.getmtime('/state/generation-worker.heartbeat'); raise SystemExit(0 if 0 <= age <= 15 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  image-api-state:
+    name: image-api-state

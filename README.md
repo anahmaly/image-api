@@ -1,199 +1,135 @@
-# Real-ESRGAN API (GPU-Enabled)
+# image-api
 
-A FastAPI-based API wrapper around **Real-ESRGAN**, packaged in Docker with full **NVIDIA GPU support** and optimized for in-memory image processing.
+Private-LAN image processing gateway with process-isolated GPU capability workers. This is an atomic API cutover: there are no legacy public service, route, container, or environment aliases.
 
-This fork includes several reliability improvements, including:
-- proper CUDA-enabled PyTorch installation
-- GPU device detection at runtime
-- in-memory processing (no temporary files)
-- simplified `/upscale/` endpoint
-- correct multipart form field usage (`file=`)
+## Architecture
 
-Upstream Real-ESRGAN project:
-https://github.com/xinntao/Real-ESRGAN
+Only the `image-api` gateway publishes port `8000`. Upscaling, background removal, and generation execute in isolated worker environments. Every real worker holds the same `/state/gpu-lane.lock` OS file lock through inference and postprocessing, so a gateway timeout or disconnect cannot release GPU capacity while native work continues. Gateway reads of internal worker image responses are streamed into a configured-size capped buffer.
 
----
+Generation admissions and state transitions are stored in SQLite with full synchronous durability. On restart, each running task is reconciled against only its canonical task-bound PNG: an exact RGB PNG with the requested dimensions and encoded-output bound is durably completed, while missing or invalid output and temporary files are cleaned before conservative terminal failure. Queued tasks remain claimable, and interrupted tasks are never resubmitted. Final PNG files are fsynced and atomically renamed before the durable success transition.
 
-## 🚀 Getting Started
+## Public API
 
-### 🛠 Build the Docker Image
+- `GET /health` — bounded worker/capability/device/readiness metadata; does not load a model.
+- `GET /v1/models` — supported models, presets, and dimension bounds; no secrets or host paths.
+- `POST /v1/upscale` — multipart `file`; required `model`, `outscale`, and `tile`; returns PNG.
+- `POST /v1/background-removal` — multipart `file`; required `model`; returns same-size PNG RGBA.
+- `POST /v1/generations` — JSON body and required `Idempotency-Key`; persists and returns `202`.
+- `GET /v1/generations/{taskId}` — queued/running/succeeded/failed status.
+- `GET /v1/generations/{taskId}/image` — final PNG after success.
 
-```sh
-docker build -t real-esrgan-api .
-```
+### Upscale
 
-### ▶️ Run the API with NVIDIA GPU Support
+Supported model IDs:
 
-Make sure you have installed:
+- `RealESRGAN_x4plus`
+- `RealESRGAN_x4plus_anime_6B`
 
-- NVIDIA drivers
-- `nvidia-container-toolkit`
-- Docker configured for GPU passthrough (`--gpus all`)
-
-Run the container:
+`outscale` is `1–4`. `tile` is `0` or a multiple of 32 through 1024. ClipArtShop's required contract is:
 
 ```sh
-docker run -d --gpus all -p 8000:8000 --name realesrgan real-esrgan-api
+curl -f -X POST \
+  'http://HOST:8000/v1/upscale?model=RealESRGAN_x4plus&outscale=2&tile=512' \
+  -F 'file=@input.png' -o output.png
 ```
 
-To start with the anime model instead:
+### Background removal
+
+Supported model IDs include rembg's `isnet-general-use`, `u2net`, `u2netp`, `isnet-anime`, and `silueta`, plus `bria-rmbg-2.0` and `birefnet-hr-matting`. The gateway bounds alpha refinement and BiRefNet inference-size options before dispatch. BRIA and BiRefNet weights are local-mounted only.
 
 ```sh
-docker run -e REALESRGAN_MODEL=RealESRGAN_x4plus_anime_6B -d --gpus all -p 8000:8000 --name realesrgan real-esrgan-api
+curl -f -X POST \
+  'http://HOST:8000/v1/background-removal?model=birefnet-hr-matting&birefnet_inference_size=2048' \
+  -F 'file=@input.png' -o foreground.png
 ```
 
-### ▶️ Or Use Docker Compose
+### Ideogram 4 generation
 
-This repo ships with `compose.yml` configured for GPU (`gpus: all`).
+Dimensions must be multiples of 16 from 256 through 2048. Supported presets are `V4_QUALITY_48`, `V4_DEFAULT_20`, and `V4_TURBO_12`. Structured captions are accepted directly and require no hosted prompt service:
+
+```sh
+curl -f -X POST http://HOST:8000/v1/generations \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: product-123-revision-4' \
+  -d '{
+    "width": 1024,
+    "height": 1024,
+    "seed": 42,
+    "sampler_preset": "V4_DEFAULT_20",
+    "structured_caption": {"description": "A blue ceramic bee on a clean white surface"}
+  }'
+```
+
+A replay with the same key and canonical request returns the original task. Reusing the key for a different request returns `409`. Plain prompts require `magic_prompt=true` and an explicitly configured `IMAGE_API_MAGIC_PROMPT_BACKEND`; missing configuration or expansion failure is never represented as success.
+
+## Model mounts and licensing
+
+No model weights are included or downloaded at request time. Production expects read-only operator mounts:
+
+- `IMAGE_API_UPSCALE_WEIGHTS_HOST_PATH`: official Real-ESRGAN `.pth` files.
+- `IMAGE_API_REMBG_WEIGHTS_HOST_PATH`: pre-fetched rembg ONNX model files.
+- `IMAGE_API_BRIA_WEIGHTS_HOST_PATH`: BRIA RMBG-2.0 model directory.
+- `IMAGE_API_BIREFNET_WEIGHTS_HOST_PATH`: BiRefNet HR model directory.
+- `IMAGE_API_IDEOGRAM_WEIGHTS_HOST_PATH`: a complete gated Ideogram 4 NF4 Hugging Face cache mount, including the repository `refs/main` and snapshot files used by the official pipeline.
+
+The Ideogram worker sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`; NF4 fails honestly without the mount or CUDA. Tokens are neither command arguments nor required for production inference. Magic-prompt credentials, if enabled, are provided only through `IMAGE_API_MAGIC_PROMPT_API_KEY`.
+
+Software and model terms are separate. See `NOTICE.md` and `licenses/`. Operators are responsible for every mounted model's applicable terms, including any separate commercial Ideogram agreement. This repository does not claim or distribute gated weights or private license artifacts.
+
+## Configuration
+
+All repository-owned configuration uses the `IMAGE_API_` prefix. Important bounds include:
+
+- `IMAGE_API_MAX_REQUEST_BYTES` (default `21000000`), enforced on the entire HTTP body before expensive work.
+- `IMAGE_API_MAX_UPLOAD_BYTES` (default `20000000`), enforced with chunked reads.
+- `IMAGE_API_MAX_INPUT_PIXELS` (default `40000000`).
+- `IMAGE_API_MAX_OUTPUT_PIXELS` (default `80000000`).
+- `IMAGE_API_MAX_QUEUE_DEPTH` (default `100`).
+- `IMAGE_API_WORKER_TIMEOUT_SECONDS` and `IMAGE_API_LANE_TIMEOUT_SECONDS`.
+
+Bind defaults to `0.0.0.0:8000`; restrict access with the host firewall to trusted LAN devices.
+
+## Compose
+
+Validate production configuration:
+
+```sh
+docker compose config
+```
+
+Run the isolated GPU deployment after mounting licensed weights:
 
 ```sh
 docker compose up -d --build
 ```
 
-This will start the API and expose it on **http://localhost:8000**.
-
-Select the anime model for Compose at startup with:
+CPU-only deterministic test mode uses fake workers and downloads no model weights:
 
 ```sh
-REALESRGAN_MODEL=RealESRGAN_x4plus_anime_6B docker compose up -d
+docker compose -f compose.yml -f compose.test.yml up --build
 ```
 
-### Model selection
-
-`REALESRGAN_MODEL` selects the one model loaded for the lifetime of the API process.
-The supported canonical values are:
-
-- `RealESRGAN_x4plus` (standard, 23-block model; the default when unset or blank)
-- `RealESRGAN_x4plus_anime_6B` (Anime 6B model)
-
-The exact friendly alias `Real-ESRGAN Anime 6B` is also accepted for the anime
-model. Matching is case-insensitive and ignores surrounding whitespace. Other
-values fail startup instead of falling back to a different model.
-
-Both official weight files are embedded in the image, so runtime startup does
-not download weights. Rebuild the image after updating from a version that did
-not include both weights.
-
-### ✅ Verify GPU is visible inside the container
+## Development
 
 ```sh
-docker exec -it realesrgan python -c "import torch; print('cuda:', torch.cuda.is_available()); print('device_count:', torch.cuda.device_count())"
+uv sync --extra test
+.venv/bin/ruff check src tests
+.venv/bin/ruff format --check src tests
+.venv/bin/mypy src/image_api src/image_api_workers
+.venv/bin/pytest
+docker compose config
+docker compose -f compose.yml -f compose.test.yml config
 ```
 
-Expected output includes `cuda: True` and a device count `>= 1`.
+Tests use real gateway, image validation, SQLite durability, atomic publication, and cross-process file locking with deterministic fake model boundaries. They do not download weights or call models/providers.
 
----
+## Source provenance
 
-## 🔗 API Endpoint
+The cutover was based on these verified source heads:
 
-The upscaling endpoint is:
+- Gateway repository base: `ad145f1003164d23d1b4bcee769b85b88417d8a9`.
+- `anahmaly/rembg-api` main: `093a635c01102207e5af1a61e64180865a0a1220`.
+- Validated BiRefNet HR implementation: `anahmaly/rembg-api#7` head `dd7b6fd434cff2077ce6e9a0cab46fe254f26f1f`.
+- Official Ideogram 4 source: `990fe1c4e950bb9e9dc90e01c0ad98ba434f83c2`.
 
-```
-POST http://localhost:8000/upscale/
-```
-
-### 📤 Example Request
-
-Note: the form field must be named **`file`** (not `image`).
-
-```sh
-curl -X POST \
-     -F "file=@path/to/image.jpg" \
-     -o output.png \
-     http://localhost:8000/upscale/
-```
-
-The API returns a PNG-formatted upscaled image.
-
-### Health endpoint
-
-`GET /health` reports readiness, the canonical active model, and whether the
-process selected CPU or CUDA, without exposing the model weight path:
-
-```json
-{
-  "status": "ok",
-  "model": "RealESRGAN_x4plus_anime_6B",
-  "device": "cuda"
-}
-```
-
-### Optional Query Parameters
-
-You can adjust the upscale factor with the `outscale` query parameter. The default is **2×**.
-
-You can also adjust Real-ESRGAN tiling with the `tile` query parameter. The default is **512**. Lowering the tile size (for example, `256`) can reduce CUDA out-of-memory risk on large images. Set `tile=0` only when you want to disable tiling; large images may OOM without tiling.
-
-```sh
-curl -X POST \
-     "http://localhost:8000/upscale/?outscale=3.75&tile=512" \
-     -F "file=@input.jpg" \
-     -o output.png
-```
-
----
-
-## 🧠 How It Works
-
-- The Real-ESRGAN model is loaded once on startup.
-- If a GPU is available, the model runs on CUDA with half-precision.
-- Uploads are decoded in memory (no temp files).
-- Results are returned as a streaming PNG response.
-
-This avoids issues with deleted temp files and is much faster.
-
----
-
-## 🛠 Requirements
-
-- Docker (with Compose plugin)
-- NVIDIA GPU
-- NVIDIA container toolkit (`nvidia-ctk`)
-- CUDA-supported GPU drivers
-- Internet access for initial model download (or place your own `.pth` model in `/Real-ESRGAN/weights/`)
-
-### Troubleshooting (Docker GPU)
-
-If an `lmdb` build reports `gcc: No such file or directory`, update to current
-main and rebuild the image. The Docker build now installs a temporary C
-toolchain for source-built dependencies and removes it after installation.
-
-If `torch.cuda.is_available()` is `False` in-container:
-
-1. Verify host GPU runtime works:
-
-```sh
-docker run --rm --gpus all nvidia/cuda:12.3.1-base-ubuntu22.04 nvidia-smi
-```
-
-2. Ensure NVIDIA container toolkit is installed/configured:
-
-```sh
-nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
-
-3. Rebuild and restart this service:
-
-```sh
-docker compose down
-docker compose up -d --build
-```
-
----
-
-## 📸 Preview
-
-![Real-ESRGAN API Preview](https://github.com/natnael9402/real-esrgan-api/blob/main/1.png)
-
----
-
-## 📝 License
-
-This project is licensed under the MIT License.
-
----
-
-Made with ❤️
-
-Forked & enhanced for GPU support and in-memory processing
+The background worker depends directly on the validated PR head; the generation worker depends directly on the official Ideogram commit. Neither upstream branch is merged or modified by this repository.
