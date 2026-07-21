@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from helpers import png
 from image_api.app import create_app
 from image_api.config import Settings, ideogram_weights_available
 from image_api.store import TaskStore
-from image_api.workers import WorkerUnavailable
+from image_api.workers import HttpWorkerClient, WorkerUnavailable
 
 
 class BrokenWorkers:
@@ -28,6 +30,54 @@ class BrokenWorkers:
 
     def background(self, *args, **kwargs):
         raise WorkerUnavailable("socket detail")
+
+
+class TrackingStream(httpx.SyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.yielded = 0
+
+    def __iter__(self):
+        for chunk in self.chunks:
+            self.yielded += 1
+            yield chunk
+
+
+@pytest.mark.parametrize("content_length", [None, "1000"])
+def test_worker_stream_cap_aborts_and_gateway_returns_one_safe_failure(
+    tmp_path, content_length
+) -> None:
+    stream = TrackingStream([b"1234", b"5678", b"must-not-be-read"])
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        headers = {} if content_length is None else {"content-length": content_length}
+        return httpx.Response(200, headers=headers, stream=stream)
+
+    workers = HttpWorkerClient(
+        "http://upscale-worker",
+        "http://background-worker",
+        timeout_seconds=1,
+        max_output_bytes=7,
+        transport=httpx.MockTransport(handler),
+    )
+    settings = Settings.for_tests(tmp_path)
+    client = TestClient(
+        create_app(settings=settings, store=TaskStore(settings.database_path), workers=workers)
+    )
+    response = client.post(
+        "/v1/upscale?model=RealESRGAN_x4plus&outscale=2&tile=512",
+        files={"file": ("x.png", png(), "image/png")},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "code": "worker_unavailable",
+            "message": "Image capability is temporarily unavailable",
+        }
+    }
+    assert "1000" not in response.text
+    assert stream.yielded == (2 if content_length is None else 0)
 
 
 def test_worker_failure_is_typed_and_safe(tmp_path) -> None:

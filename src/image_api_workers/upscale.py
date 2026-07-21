@@ -13,12 +13,13 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 
+from image_api_workers.execution import execute_in_gpu_lane
+
 logger = logging.getLogger(__name__)
 MODELS = {
     "RealESRGAN_x4plus": (23, "RealESRGAN_x4plus.pth"),
     "RealESRGAN_x4plus_anime_6B": (6, "RealESRGAN_x4plus_anime_6B.pth"),
 }
-_model_lock = asyncio.Lock()
 _loaded_model_name: str | None = None
 
 
@@ -97,6 +98,34 @@ def health() -> dict[str, object]:
     return _runtime_status()
 
 
+def _run_upscale(data: bytes, *, model: str, outscale: float, tile: int) -> bytes:
+    import numpy as np
+    import torch
+
+    with Image.open(io.BytesIO(data)) as image:
+        image.load()
+        source = np.asarray(image.convert("RGBA" if image.mode == "RGBA" else "RGB"))
+    if source.shape[-1] == 3:
+        source = source[:, :, ::-1]
+    else:
+        source = source[:, :, [2, 1, 0, 3]]
+    _release_model_for_transition(model)
+    backend = _load_model(model)
+    previous = backend.tile_size
+    backend.tile_size = tile
+    try:
+        with torch.inference_mode():
+            result, _ = backend.enhance(source, outscale=outscale)
+    finally:
+        backend.tile_size = previous
+    import cv2
+
+    ok, encoded = cv2.imencode(".png", result)
+    if not ok:
+        raise RuntimeError("PNG encoding failed")
+    return bytes(encoded.tobytes())
+
+
 @app.post("/internal/upscale", response_class=Response)
 async def upscale(
     file: Annotated[UploadFile, File()],
@@ -109,32 +138,12 @@ async def upscale(
     data = await file.read()
     await file.close()
     try:
-        import numpy as np
-        import torch
-
-        with Image.open(io.BytesIO(data)) as image:
-            image.load()
-            source = np.asarray(image.convert("RGBA" if image.mode == "RGBA" else "RGB"))
-        if source.shape[-1] == 3:
-            source = source[:, :, ::-1]
-        else:
-            source = source[:, :, [2, 1, 0, 3]]
-        async with _model_lock:
-            _release_model_for_transition(model)
-            backend = _load_model(model)
-            previous = backend.tile_size
-            backend.tile_size = tile
-            try:
-                with torch.inference_mode():
-                    result, _ = await asyncio.to_thread(backend.enhance, source, outscale=outscale)
-            finally:
-                backend.tile_size = previous
-        import cv2
-
-        ok, encoded = cv2.imencode(".png", result)
-        if not ok:
-            raise RuntimeError("PNG encoding failed")
-        return Response(encoded.tobytes(), media_type="image/png")
+        encoded = await asyncio.to_thread(
+            execute_in_gpu_lane,
+            "upscale",
+            lambda: _run_upscale(data, model=model, outscale=outscale, tile=tile),
+        )
+        return Response(encoded, media_type="image/png")
     except Exception as exc:
         logger.exception("upscale worker failed: model=%s", model)
         raise HTTPException(500, "internal image processing error") from exc

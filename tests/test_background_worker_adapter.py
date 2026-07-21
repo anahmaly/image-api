@@ -61,8 +61,9 @@ def _install_pr7_fakes(monkeypatch, calls: list[tuple[str, dict[str, object]]]) 
     ],
 )
 def test_pr7_backends_dispatch_with_bounded_options_and_rgba(
-    monkeypatch, model: str, expected: str, query: str
+    monkeypatch, tmp_path, model: str, expected: str, query: str
 ) -> None:
+    monkeypatch.setenv("IMAGE_API_STATE_DIR", str(tmp_path))
     calls: list[tuple[str, dict[str, object]]] = []
     _install_pr7_fakes(monkeypatch, calls)
     client = TestClient(app)

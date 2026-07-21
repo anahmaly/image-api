@@ -183,11 +183,33 @@ class TaskStore:
         if changed != 1:
             raise RuntimeError("invalid task state transition")
 
-    def recover_after_restart(self) -> int:
+    def running(self) -> list[TaskRecord]:
         with self._connect() as connection:
-            changed = connection.execute(
-                """UPDATE generation_tasks SET status='failed',error_code='worker_interrupted',
-                   worker_id=NULL,updated_at=? WHERE status='running'""",
-                (time.time_ns(),),
-            ).rowcount
-        return int(changed)
+            rows = connection.execute(
+                "SELECT * FROM generation_tasks WHERE status='running' ORDER BY created_at"
+            ).fetchall()
+        return [self._row(row) for row in rows]
+
+    def reconcile_success(self, task_id: str, image_name: str) -> bool:
+        """Idempotently bind a validated canonical output to a running task."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status,image_name FROM generation_tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            if row["status"] == "succeeded" and row["image_name"] == image_name:
+                connection.commit()
+                return True
+            if row["status"] != "running":
+                connection.rollback()
+                return False
+            connection.execute(
+                """UPDATE generation_tasks SET status='succeeded',error_code=NULL,image_name=?,
+                   worker_id=NULL,updated_at=? WHERE task_id=? AND status='running'""",
+                (image_name, time.time_ns(), task_id),
+            )
+            connection.commit()
+            return True

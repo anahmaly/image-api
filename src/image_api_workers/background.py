@@ -13,10 +13,11 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 
+from image_api_workers.execution import execute_in_gpu_lane
+
 logger = logging.getLogger(__name__)
 REMBG_MODELS = ("isnet-general-use", "u2net", "u2netp", "isnet-anime", "silueta")
 REMBG_FILES = {model: f"{model}.onnx" for model in REMBG_MODELS}
-_model_lock = asyncio.Lock()
 _active_model: str | None = None
 
 
@@ -202,9 +203,10 @@ async def remove_background(
     data = await file.read()
     await file.close()
     try:
-        async with _model_lock:
-            encoded = await asyncio.to_thread(
-                _run_background,
+        encoded = await asyncio.to_thread(
+            execute_in_gpu_lane,
+            "background-removal",
+            lambda: _run_background(
                 data,
                 model=model,
                 alpha_blur=alpha_blur,
@@ -214,7 +216,8 @@ async def remove_background(
                 birefnet_inference_size=birefnet_inference_size,
                 birefnet_foreground_refinement=birefnet_foreground_refinement,
                 model_input_size=model_input_size,
-            )
+            ),
+        )
         return Response(encoded, media_type="image/png")
     except Exception as exc:
         logger.exception("background worker failed: model=%s", model)

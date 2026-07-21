@@ -4,9 +4,9 @@ Private-LAN image processing gateway with process-isolated GPU capability worker
 
 ## Architecture
 
-Only the `image-api` gateway publishes port `8000`. Upscaling, background removal, and generation execute in isolated worker environments. Gateway synchronous requests and the durable generation worker share `/state/gpu-lane.lock`, an OS file lock that admits one GPU capability at a time across processes.
+Only the `image-api` gateway publishes port `8000`. Upscaling, background removal, and generation execute in isolated worker environments. Every real worker holds the same `/state/gpu-lane.lock` OS file lock through inference and postprocessing, so a gateway timeout or disconnect cannot release GPU capacity while native work continues. Gateway reads of internal worker image responses are streamed into a configured-size capped buffer.
 
-Generation admissions and state transitions are stored in SQLite with full synchronous durability. A running task found after restart is conservatively failed and never resubmitted; queued tasks remain claimable. Final PNG files are fsynced and atomically renamed before the durable success transition.
+Generation admissions and state transitions are stored in SQLite with full synchronous durability. On restart, each running task is reconciled against only its canonical task-bound PNG: an exact RGB PNG with the requested dimensions and encoded-output bound is durably completed, while missing or invalid output and temporary files are cleaned before conservative terminal failure. Queued tasks remain claimable, and interrupted tasks are never resubmitted. Final PNG files are fsynced and atomically renamed before the durable success transition.
 
 ## Public API
 

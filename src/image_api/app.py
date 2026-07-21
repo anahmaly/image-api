@@ -219,6 +219,7 @@ def create_app(
         os.getenv("IMAGE_API_UPSCALE_WORKER_URL", "http://upscale-worker:9001"),
         os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
         settings.worker_timeout_seconds,
+        settings.max_request_bytes,
     )
     lane = GpuLane(settings.gpu_lane_path, settings.lane_timeout_seconds)
 
@@ -350,8 +351,7 @@ def create_app(
         expected = (round(info.width * outscale), round(info.height * outscale))
         if expected[0] * expected[1] > settings.max_output_pixels:
             raise ImageTooLarge("upscaled output exceeds configured limits")
-        with lane.acquire("upscale"):
-            encoded = workers.upscale(data, model=model, outscale=outscale, tile=tile)
+        encoded = workers.upscale(data, model=model, outscale=outscale, tile=tile)
         validate_png_output(
             encoded,
             expected_size=expected,
@@ -402,8 +402,7 @@ def create_app(
             "birefnet_foreground_refinement": birefnet_foreground_refinement,
             "model_input_size": model_input_size,
         }
-        with lane.acquire("background-removal"):
-            encoded = workers.background(data, **parameters)
+        encoded = workers.background(data, **parameters)
         validate_png_output(
             encoded,
             expected_size=(info.width, info.height),

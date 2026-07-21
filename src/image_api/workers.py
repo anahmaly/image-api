@@ -24,10 +24,18 @@ class HttpWorkerClient:
     model_invocations = 0
     model_loads = 0
 
-    def __init__(self, upscale_url: str, background_url: str, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        upscale_url: str,
+        background_url: str,
+        timeout_seconds: float,
+        max_output_bytes: int,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
         self.upscale_url = upscale_url.rstrip("/")
         self.background_url = background_url.rstrip("/")
-        self.timeout = httpx.Timeout(timeout_seconds)
+        self.max_output_bytes = max_output_bytes
+        self.client = httpx.Client(timeout=httpx.Timeout(timeout_seconds), transport=transport)
 
     def _get_health(self, base: str) -> dict[str, object]:
         try:
@@ -50,16 +58,25 @@ class HttpWorkerClient:
 
     def _post(self, url: str, data: bytes, parameters: dict[str, object]) -> bytes:
         try:
-            response = httpx.post(
+            with self.client.stream(
+                "POST",
                 url,
                 params={
                     key: None if value is None else str(value) for key, value in parameters.items()
                 },
                 files={"file": ("input", data, "application/octet-stream")},
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            return response.content
+            ) as response:
+                response.raise_for_status()
+                declared = response.headers.get("content-length")
+                if declared is not None and declared.isdigit():
+                    if int(declared) > self.max_output_bytes:
+                        raise WorkerUnavailable("worker output exceeds configured limit")
+                output = bytearray()
+                for chunk in response.iter_bytes():
+                    if len(chunk) > self.max_output_bytes - len(output):
+                        raise WorkerUnavailable("worker output exceeds configured limit")
+                    output.extend(chunk)
+                return bytes(output)
         except Exception as exc:
             raise WorkerUnavailable("worker request failed") from exc
 

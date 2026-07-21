@@ -5,7 +5,11 @@ import os
 import time
 from pathlib import Path
 
-from image_api.generation import GenerationRunner, start_worker_heartbeat
+from image_api.generation import (
+    GenerationRunner,
+    recover_interrupted_tasks,
+    start_worker_heartbeat,
+)
 from image_api.lane import GpuLane
 from image_api.store import TaskStore
 from image_api_workers.ideogram import IdeogramModel
@@ -18,9 +22,9 @@ def main() -> None:
     state = Path(os.getenv("IMAGE_API_STATE_DIR", "/state"))
     start_worker_heartbeat(state / "generation-worker.heartbeat")
     store = TaskStore(state / "tasks.sqlite3", int(os.getenv("IMAGE_API_MAX_QUEUE_DEPTH", "100")))
-    recovered = store.recover_after_restart()
+    recovered = recover_interrupted_tasks(store, state / "outputs")
     if recovered:
-        logger.warning("Conservatively failed interrupted generation tasks: count=%s", recovered)
+        logger.warning("Reconciled interrupted generation tasks: count=%s", recovered)
     runner = GenerationRunner(
         store,
         GpuLane(state / "gpu-lane.lock", float(os.getenv("IMAGE_API_LANE_TIMEOUT_SECONDS", "120"))),
