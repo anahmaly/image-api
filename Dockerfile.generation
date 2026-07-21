@@ -6,6 +6,6 @@ WORKDIR /srv/image-api
 COPY pyproject.toml README.md LICENSE NOTICE.md ./
 COPY licenses ./licenses
 COPY src ./src
-RUN pip install --no-cache-dir . \
+RUN python -m pip install --break-system-packages --no-cache-dir . \
     "git+https://github.com/ideogram-oss/ideogram4.git@990fe1c4e950bb9e9dc90e01c0ad98ba434f83c2"
 CMD ["python", "-m", "image_api_workers.generation_worker"]

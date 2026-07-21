@@ -39,6 +39,13 @@ def _weight_index_available(index_path: Path) -> bool:
     return True
 
 
+def _weights_available(directory: Path, filename: str) -> bool:
+    weights = directory / filename
+    return weights.is_file() or _weight_index_available(
+        weights.with_name(f"{weights.name}.index.json")
+    )
+
+
 def ideogram_weights_available(weights_path: Path, repository_id: str) -> bool:
     if not REPOSITORY_ID_PATTERN.fullmatch(repository_id):
         return False
@@ -52,24 +59,20 @@ def ideogram_weights_available(weights_path: Path, repository_id: str) -> bool:
     if not SNAPSHOT_PATTERN.fullmatch(snapshot_name):
         return False
     snapshot = repository_cache / "snapshots" / snapshot_name
-    indexes = (
-        snapshot / "transformer/diffusion_pytorch_model.safetensors.index.json",
-        snapshot / "unconditional_transformer/diffusion_pytorch_model.safetensors.index.json",
-    )
+    diffusion_components = (snapshot / "transformer", snapshot / "unconditional_transformer")
     required = (
         "vae/diffusion_pytorch_model.safetensors",
         "text_encoder/config.json",
         "tokenizer/tokenizer_config.json",
         "tokenizer/tokenizer.json",
     )
-    text_encoder = snapshot / "text_encoder"
-    text_weights_available = (
-        text_encoder / "model.safetensors"
-    ).is_file() or _weight_index_available(text_encoder / "model.safetensors.index.json")
     return (
         all((snapshot / relative).is_file() for relative in required)
-        and all(_weight_index_available(index) for index in indexes)
-        and text_weights_available
+        and all(
+            _weights_available(component, "diffusion_pytorch_model.safetensors")
+            for component in diffusion_components
+        )
+        and _weights_available(snapshot / "text_encoder", "model.safetensors")
     )
 
 
