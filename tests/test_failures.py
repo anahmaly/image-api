@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -122,15 +124,17 @@ def test_missing_generation_runtime_is_honestly_disabled(tmp_path) -> None:
     assert generation["reason"] in {"weights_unavailable", "cuda_unavailable"}
 
 
-def test_ideogram_mount_requires_a_complete_offline_cache_shape(tmp_path) -> None:
-    repository_id = "ideogram-ai/ideogram-4-nf4"
-    assert ideogram_weights_available(tmp_path, repository_id) is False
-    snapshot_name = "a" * 40
+IDEOGRAM_REPOSITORY_ID = "ideogram-ai/ideogram-4-nf4"
+OFFICIAL_SNAPSHOT = "f664347839e0a87bc495f5c9483cc0014b8e344e"
+DIFFUSION_COMPONENTS = ("transformer", "unconditional_transformer")
+
+
+def create_ideogram_snapshot(tmp_path):
     repository = tmp_path / "hub" / "models--ideogram-ai--ideogram-4-nf4"
     reference = repository / "refs" / "main"
     reference.parent.mkdir(parents=True)
-    reference.write_text(snapshot_name)
-    snapshot = repository / "snapshots" / snapshot_name
+    reference.write_text(OFFICIAL_SNAPSHOT)
+    snapshot = repository / "snapshots" / OFFICIAL_SNAPSHOT
     required = (
         "vae/diffusion_pytorch_model.safetensors",
         "text_encoder/config.json",
@@ -142,10 +146,106 @@ def test_ideogram_mount_requires_a_complete_offline_cache_shape(tmp_path) -> Non
         path = snapshot / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{}")
-    for directory in ("transformer", "unconditional_transformer"):
-        index = snapshot / directory / "diffusion_pytorch_model.safetensors.index.json"
-        shard = snapshot / directory / "weights-00001.safetensors"
-        index.parent.mkdir(parents=True, exist_ok=True)
-        index.write_text('{"weight_map":{"layer":"weights-00001.safetensors"}}')
-        shard.write_bytes(b"weights")
-    assert ideogram_weights_available(tmp_path, repository_id) is True
+    return snapshot
+
+
+def add_direct_diffusion_weights(snapshot, component):
+    weights = snapshot / component / "diffusion_pytorch_model.safetensors"
+    weights.parent.mkdir(parents=True, exist_ok=True)
+    weights.write_bytes(b"weights")
+
+
+def add_sharded_diffusion_weights(snapshot, component):
+    directory = snapshot / component
+    index = directory / "diffusion_pytorch_model.safetensors.index.json"
+    shard = directory / "weights-00001.safetensors"
+    directory.mkdir(parents=True, exist_ok=True)
+    index.write_text(json.dumps({"weight_map": {"layer": shard.name}}))
+    shard.write_bytes(b"weights")
+    return index, shard
+
+
+def test_official_unsharded_ideogram_snapshot_is_available(tmp_path) -> None:
+    snapshot = create_ideogram_snapshot(tmp_path)
+    for component in DIFFUSION_COMPONENTS:
+        add_direct_diffusion_weights(snapshot, component)
+
+    assert ideogram_weights_available(tmp_path, IDEOGRAM_REPOSITORY_ID) is True
+
+
+def test_both_sharded_diffusion_components_are_available(tmp_path) -> None:
+    snapshot = create_ideogram_snapshot(tmp_path)
+    for component in DIFFUSION_COMPONENTS:
+        add_sharded_diffusion_weights(snapshot, component)
+
+    assert ideogram_weights_available(tmp_path, IDEOGRAM_REPOSITORY_ID) is True
+
+
+def test_direct_and_sharded_diffusion_components_are_independently_available(tmp_path) -> None:
+    snapshot = create_ideogram_snapshot(tmp_path)
+    add_direct_diffusion_weights(snapshot, "transformer")
+    add_sharded_diffusion_weights(snapshot, "unconditional_transformer")
+
+    assert ideogram_weights_available(tmp_path, IDEOGRAM_REPOSITORY_ID) is True
+
+
+def test_missing_direct_diffusion_weights_are_unavailable(tmp_path) -> None:
+    snapshot = create_ideogram_snapshot(tmp_path)
+    add_direct_diffusion_weights(snapshot, "transformer")
+
+    assert ideogram_weights_available(tmp_path, IDEOGRAM_REPOSITORY_ID) is False
+
+
+@pytest.mark.parametrize(
+    "invalid_index", ["malformed", "empty", "oversized", "absolute", "traversal", "missing"]
+)
+def test_invalid_diffusion_indexes_are_unavailable(tmp_path, invalid_index) -> None:
+    snapshot = create_ideogram_snapshot(tmp_path)
+    add_direct_diffusion_weights(snapshot, "transformer")
+    index, shard = add_sharded_diffusion_weights(snapshot, "unconditional_transformer")
+
+    if invalid_index == "malformed":
+        index.write_text("{")
+    elif invalid_index == "empty":
+        index.write_text(json.dumps({"weight_map": {}}))
+    elif invalid_index == "oversized":
+        index.write_bytes(b" " * 5_000_001)
+    elif invalid_index == "absolute":
+        index.write_text(json.dumps({"weight_map": {"layer": "/weights.safetensors"}}))
+    elif invalid_index == "traversal":
+        index.write_text(json.dumps({"weight_map": {"layer": "../weights.safetensors"}}))
+    else:
+        shard.unlink()
+
+    assert ideogram_weights_available(tmp_path, IDEOGRAM_REPOSITORY_ID) is False
+
+
+def test_text_encoder_sharded_weights_are_available(tmp_path) -> None:
+    snapshot = create_ideogram_snapshot(tmp_path)
+    for component in DIFFUSION_COMPONENTS:
+        add_direct_diffusion_weights(snapshot, component)
+    (snapshot / "text_encoder/model.safetensors").unlink()
+    index = snapshot / "text_encoder/model.safetensors.index.json"
+    shard = snapshot / "text_encoder/model-00001-of-00001.safetensors"
+    index.write_text(json.dumps({"weight_map": {"encoder": shard.name}}))
+    shard.write_bytes(b"weights")
+
+    assert ideogram_weights_available(tmp_path, IDEOGRAM_REPOSITORY_ID) is True
+
+
+def test_missing_text_encoder_weights_are_unavailable(tmp_path) -> None:
+    snapshot = create_ideogram_snapshot(tmp_path)
+    for component in DIFFUSION_COMPONENTS:
+        add_direct_diffusion_weights(snapshot, component)
+    (snapshot / "text_encoder/model.safetensors").unlink()
+
+    assert ideogram_weights_available(tmp_path, IDEOGRAM_REPOSITORY_ID) is False
+
+
+@pytest.mark.parametrize("reference", ["", "not-a-sha", "a" * 65])
+def test_invalid_main_reference_is_unavailable(tmp_path, reference) -> None:
+    create_ideogram_snapshot(tmp_path)
+    reference_path = tmp_path / "hub/models--ideogram-ai--ideogram-4-nf4/refs/main"
+    reference_path.write_text(reference)
+
+    assert ideogram_weights_available(tmp_path, IDEOGRAM_REPOSITORY_ID) is False

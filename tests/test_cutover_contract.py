@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,3 +59,25 @@ def test_pinned_upstream_sources_and_no_weight_download_commands() -> None:
     assert "wget" not in dockerfiles
     assert "curl" not in dockerfiles
     assert "hf auth" not in dockerfiles.lower()
+
+
+def test_generation_install_handles_pep_668_and_keeps_ideogram_pinned() -> None:
+    dockerfiles = list(ROOT.glob("Dockerfile*"))
+    generation = (ROOT / "Dockerfile.generation").read_text().replace("\\\n", " ")
+    install_line = next(
+        line.removeprefix("RUN ")
+        for line in generation.splitlines()
+        if line.startswith("RUN ") and "ideogram4.git" in line
+    )
+    tokens = shlex.split(install_line)
+
+    assert tokens[:4] == ["python", "-m", "pip", "install"]
+    assert "--break-system-packages" in tokens
+    assert (
+        "git+https://github.com/ideogram-oss/ideogram4.git@990fe1c4e950bb9e9dc90e01c0ad98ba434f83c2"
+    ) in tokens
+    assert all(
+        "--break-system-packages" not in path.read_text()
+        for path in dockerfiles
+        if path.name != "Dockerfile.generation"
+    )
