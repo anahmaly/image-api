@@ -26,15 +26,7 @@ from image_api.workers import HttpWorkerClient, WorkerClient, WorkerUnavailable
 logger = logging.getLogger(__name__)
 
 UPSCALE_MODELS = ("RealESRGAN_x4plus", "RealESRGAN_x4plus_anime_6B")
-BACKGROUND_MODELS = (
-    "isnet-general-use",
-    "u2net",
-    "u2netp",
-    "isnet-anime",
-    "silueta",
-    "bria-rmbg-2.0",
-    "birefnet-hr-matting",
-)
+BACKGROUND_MODELS = ("bria-rmbg-2.0", "birefnet-hr-matting")
 SAMPLER_PRESETS = ("V4_QUALITY_48", "V4_DEFAULT_20", "V4_TURBO_12")
 TASK_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 IDEMPOTENCY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
@@ -365,15 +357,7 @@ def create_app(
     async def background_removal(
         file: Annotated[UploadFile, File()],
         model: Annotated[
-            Literal[
-                "isnet-general-use",
-                "u2net",
-                "u2netp",
-                "isnet-anime",
-                "silueta",
-                "bria-rmbg-2.0",
-                "birefnet-hr-matting",
-            ],
+            Literal["bria-rmbg-2.0", "birefnet-hr-matting"],
             Query(),
         ],
         alpha_blur: Annotated[float, Query(ge=0, le=20)] = 0,

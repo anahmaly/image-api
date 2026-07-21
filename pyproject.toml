@@ -44,8 +44,6 @@ module = [
   "ideogram4.*",
   "numpy",
   "realesrgan",
-  "rembg",
-  "rembg.*",
   "rembg_api.*",
   "torch",
 ]

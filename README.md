@@ -35,7 +35,7 @@ curl -f -X POST \
 
 ### Background removal
 
-Supported model IDs include rembg's `isnet-general-use`, `u2net`, `u2netp`, `isnet-anime`, and `silueta`, plus `bria-rmbg-2.0` and `birefnet-hr-matting`. The gateway bounds alpha refinement and BiRefNet inference-size options before dispatch. BRIA and BiRefNet weights are local-mounted only.
+Supported model IDs are `bria-rmbg-2.0` and `birefnet-hr-matting`. The gateway bounds alpha refinement and BiRefNet inference-size options before dispatch. Both models use local-mounted weights only.
 
 ```sh
 curl -f -X POST \
@@ -67,7 +67,6 @@ A replay with the same key and canonical request returns the original task. Reus
 No model weights are included or downloaded at request time. Production expects read-only operator mounts:
 
 - `IMAGE_API_UPSCALE_WEIGHTS_HOST_PATH`: official Real-ESRGAN `.pth` files.
-- `IMAGE_API_REMBG_WEIGHTS_HOST_PATH`: pre-fetched rembg ONNX model files.
 - `IMAGE_API_BRIA_WEIGHTS_HOST_PATH`: BRIA RMBG-2.0 model directory.
 - `IMAGE_API_BIREFNET_WEIGHTS_HOST_PATH`: BiRefNet HR model directory.
 - `IMAGE_API_IDEOGRAM_WEIGHTS_HOST_PATH`: a complete gated Ideogram 4 NF4 Hugging Face cache mount, including the repository `refs/main` and snapshot files used by the official pipeline.

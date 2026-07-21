@@ -73,12 +73,10 @@ services:
     expose:
       - "9002"
     environment:
-      IMAGE_API_REMBG_WEIGHTS_PATH: /models/rembg
       IMAGE_API_BRIA_WEIGHTS_PATH: /models/bria-rmbg-2.0
       IMAGE_API_BIREFNET_WEIGHTS_PATH: /models/birefnet-hr
       IMAGE_API_BIREFNET_REVISION: 5d6b6f8adcb5b417c871b1d84ceaae9871355b7f
     volumes:
-      - ${IMAGE_API_REMBG_WEIGHTS_HOST_PATH:-./models/rembg}:/models/rembg:ro
       - ${IMAGE_API_BRIA_WEIGHTS_HOST_PATH:-./models/bria-rmbg-2.0}:/models/bria-rmbg-2.0:ro
       - ${IMAGE_API_BIREFNET_WEIGHTS_HOST_PATH:-./models/birefnet-hr}:/models/birefnet-hr:ro
       - image-api-state:/state
