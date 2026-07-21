@@ -89,7 +89,7 @@ def main() -> None:
     state = settings.state_dir
     start_worker_heartbeat(settings.generation_heartbeat_path)
     store = TaskStore(settings.database_path, settings.max_queue_depth)
-    recovered = recover_interrupted_tasks(store, settings.output_dir)
+    recovered = recover_interrupted_tasks(store, settings.output_dir, settings.source_dir)
     if recovered:
         logger.warning("Reconciled interrupted generation tasks: count=%s", recovered)
     models = GenerationModels(
@@ -136,6 +136,7 @@ def main() -> None:
                 os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
             )
         ),
+        source_dir=settings.source_dir,
     )
     poll = float(os.getenv("IMAGE_API_GENERATION_POLL_SECONDS", "0.5"))
     while True:

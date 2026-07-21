@@ -16,7 +16,7 @@ from PIL import Image
 from pydantic import BaseModel, Field, model_validator
 
 from image_api.config import Settings, ideogram_weights_available, longcat_weights_available
-from image_api.generation import worker_heartbeat_alive
+from image_api.generation import source_file_lock, worker_heartbeat_alive
 from image_api.images import (
     ImageTooLarge,
     InvalidImage,
@@ -590,7 +590,7 @@ def create_app(
         )
         original_hash = hashlib.sha256(data).hexdigest()
         normalized = _normalize_source(data)
-        with _ADMISSION_LOCK:
+        with _ADMISSION_LOCK, source_file_lock(settings.source_dir):
             candidate_name = f"{original_hash}-{hashlib.sha256(normalized).hexdigest()}.png"
             source_existed = (settings.source_dir / candidate_name).is_file()
             try:
@@ -632,6 +632,8 @@ def create_app(
                     _remove_orphan_source(settings.source_dir, source_name, store)
                 logger.exception("image-edit admission failed after source persistence")
                 raise
+            if task.status in {"succeeded", "failed"}:
+                _remove_orphan_source(settings.source_dir, source_name, store)
         return _safe_task(task)
 
     @app.get("/v1/image-edits/{task_id}")

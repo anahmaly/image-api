@@ -53,9 +53,13 @@ def main() -> None:
     start_worker_heartbeat(state / "generation-worker.heartbeat")
     threading.Thread(target=_serve, name="fake-generation-control", daemon=True).start()
     store = TaskStore(state / "tasks.sqlite3")
-    recover_interrupted_tasks(store, state / "outputs")
+    recover_interrupted_tasks(store, state / "outputs", state / "sources")
     runner = GenerationRunner(
-        store, GpuLane(state / "gpu-lane.lock", 30), state / "outputs", fake_model
+        store,
+        GpuLane(state / "gpu-lane.lock", 30),
+        state / "outputs",
+        fake_model,
+        source_dir=state / "sources",
     )
     while True:
         if not runner.run_one():
