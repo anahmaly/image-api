@@ -1,0 +1,36 @@
+name: image-api
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install deterministic test environment
+        run: uv sync --extra test --locked
+      - name: Lint and format
+        run: |
+          .venv/bin/ruff check src tests
+          .venv/bin/ruff format --check src tests
+      - name: Type check
+        run: .venv/bin/mypy src/image_api src/image_api_workers
+      - name: Test
+        run: .venv/bin/pytest -q
+      - name: Validate production and CPU-only Compose
+        run: |
+          docker compose config --quiet
+          docker compose -f compose.yml -f compose.test.yml config --quiet
+      - name: Build gateway and CPU test worker
+        run: |
+          docker build -f Dockerfile.gateway -t image-api-gateway:test .
+          docker build -f Dockerfile.test -t image-api-test-worker:test .
+      - name: Package smoke
+        run: uv build

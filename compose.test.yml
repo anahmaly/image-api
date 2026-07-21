@@ -1,0 +1,24 @@
+services:
+  image-api:
+    environment:
+      IMAGE_API_CUDA_AVAILABLE: "false"
+  upscale-worker:
+    image: image-api-test-worker:local
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    gpus: []
+  background-worker:
+    image: image-api-test-worker:local
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["uvicorn", "image_api_workers.fake:app", "--host", "0.0.0.0", "--port", "9002"]
+    gpus: []
+  generation-worker:
+    image: image-api-test-worker:local
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["python", "-m", "image_api_workers.fake_generation"]
+    gpus: []

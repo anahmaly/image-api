@@ -1,0 +1,9 @@
+.git
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+tests
+models
+state
+1.png
