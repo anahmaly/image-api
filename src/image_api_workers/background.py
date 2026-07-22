@@ -14,8 +14,10 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 
+from image_api.images import validate_dimensions
 from image_api.workers import PeerEvictor
 from image_api_workers.execution import execute_in_gpu_lane
+from image_api_workers.uploads import read_bounded_upload
 
 logger = logging.getLogger(__name__)
 _active_model: str | None = None
@@ -80,6 +82,18 @@ def _release_resident_models() -> None:
             raise RuntimeError("background model release failed") from release_errors[0]
 
 
+def _validate_worker_dimensions(width: int, height: int, *, output: bool) -> None:
+    suffix = "OUTPUT" if output else "INPUT"
+    validate_dimensions(
+        width,
+        height,
+        max_width=int(os.getenv("IMAGE_API_MAX_INPUT_WIDTH", "8192")),
+        max_height=int(os.getenv("IMAGE_API_MAX_INPUT_HEIGHT", "8192")),
+        max_pixels=int(os.getenv(f"IMAGE_API_MAX_{suffix}_PIXELS", "67108864")),
+        max_decoded_bytes=int(os.getenv(f"IMAGE_API_MAX_DECODED_{suffix}_BYTES", "268435456")),
+    )
+
+
 def _run_background(
     data: bytes,
     *,
@@ -93,6 +107,13 @@ def _run_background(
     model_input_size: int,
 ) -> bytes:
     global _active_model
+    if not 512 <= birefnet_inference_size <= 4096:
+        raise ValueError("invalid BiRefNet inference size")
+    with Image.open(io.BytesIO(data)) as source_image:
+        expected_size = source_image.size
+        _validate_worker_dimensions(*expected_size, output=False)
+        _validate_worker_dimensions(*expected_size, output=True)
+        source_image.verify()
     if _active_model is not None and _active_model != model:
         _release_resident_models()
     if model == "birefnet-hr-matting":
@@ -134,7 +155,7 @@ def _run_background(
         return_alpha=False,
         return_checker_preview=False,
         checker_size=32,
-        max_encoded_bytes=40_000_000,
+        max_encoded_bytes=int(os.getenv("IMAGE_API_MAX_ENCODED_OUTPUT_BYTES", "300000000")),
     )
     if not isinstance(encoded, bytes):
         raise RuntimeError("background post-processing returned invalid bytes")
@@ -142,6 +163,8 @@ def _run_background(
         output.load()
         if output.mode != "RGBA":
             raise RuntimeError("background backend did not return RGBA")
+        if output.size != expected_size:
+            raise RuntimeError("background backend returned unexpected dimensions")
     _active_model = model
     return encoded
 
@@ -213,8 +236,8 @@ async def remove_background(
     birefnet_foreground_refinement: bool = False,
     model_input_size: Annotated[int, Query(ge=512, le=2048)] = 1024,
 ) -> Response:
-    data = await file.read()
-    await file.close()
+    max_upload_bytes = int(os.getenv("IMAGE_API_MAX_UPLOAD_BYTES", "280000000"))
+    data = await read_bounded_upload(file, max_upload_bytes)
     try:
 
         def operation() -> bytes:

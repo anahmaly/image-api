@@ -8,23 +8,29 @@ import os
 import re
 import threading
 import uuid
+from tempfile import SpooledTemporaryFile
 from typing import Annotated, Any, Literal, cast
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image
+from starlette.background import BackgroundTask
+from starlette.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 from image_api.config import Settings, ideogram_weights_available, longcat_weights_available
 from image_api.generation import source_file_lock, worker_heartbeat_alive
 from image_api.images import (
+    ImageInfo,
     ImageTooLarge,
     InvalidImage,
     InvalidWorkerImage,
+    processing_output_size,
     validate_image,
     validate_png_output,
 )
 from image_api.lane import GpuLane, LaneBusy
+from image_api.state import state_write_ready
 from image_api.store import IdempotencyConflict, QueueFull, TaskRecord, TaskStore
 from image_api.workers import HttpWorkerClient, WorkerClient, WorkerUnavailable
 
@@ -37,6 +43,7 @@ LONGCAT_MODELS = ("longcat-image-edit", "longcat-image-edit-turbo")
 TASK_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 IDEMPOTENCY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 UPLOAD_CHUNK_BYTES = 64 * 1024
+UPLOAD_SPOOL_MEMORY_BYTES = 8 * 1024 * 1024
 _ADMISSION_LOCK = threading.Lock()
 
 
@@ -126,17 +133,53 @@ class GenerationRequest(BaseModel):
 
 
 async def _read_upload(file: UploadFile, max_bytes: int) -> bytes:
-    chunks: list[bytes] = []
     total = 0
     try:
-        while chunk := await file.read(UPLOAD_CHUNK_BYTES):
-            total += len(chunk)
-            if total > max_bytes:
-                raise ImageTooLarge("upload exceeds configured limit")
-            chunks.append(chunk)
-        return b"".join(chunks)
+        with SpooledTemporaryFile(max_size=UPLOAD_SPOOL_MEMORY_BYTES, mode="w+b") as spool:
+            while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+                if len(chunk) > max_bytes - total:
+                    raise ImageTooLarge("upload exceeds configured limit")
+                spool.write(chunk)
+                total += len(chunk)
+            spool.seek(0)
+            return spool.read()
     finally:
         await file.close()
+
+
+async def _validated_sync_upload(file: UploadFile, settings: Settings) -> ImageInfo:
+    try:
+        await file.seek(0)
+        info = validate_image(
+            file.file,
+            max_bytes=settings.max_upload_bytes,
+            max_width=settings.max_input_width,
+            max_height=settings.max_input_height,
+            max_pixels=settings.max_input_pixels,
+            max_decoded_bytes=settings.max_decoded_input_bytes,
+        )
+        await file.seek(0)
+        return info
+    except BaseException:
+        await file.close()
+        raise
+
+
+def _worker_image_response(encoded: object) -> Response:
+    if isinstance(encoded, bytes):
+        return Response(encoded, media_type="image/png")
+    if not all(hasattr(encoded, member) for member in ("read", "seek", "close")):
+        raise InvalidWorkerImage("worker output type mismatch")
+    stream = cast(Any, encoded)
+    stream.seek(0)
+
+    def chunks() -> Any:
+        while chunk := stream.read(UPLOAD_CHUNK_BYTES):
+            yield chunk
+
+    return StreamingResponse(
+        chunks(), media_type="image/png", background=BackgroundTask(stream.close)
+    )
 
 
 def _normalize_source(data: bytes) -> bytes:
@@ -346,7 +389,7 @@ def create_app(
         os.getenv("IMAGE_API_UPSCALE_WORKER_URL", "http://upscale-worker:9001"),
         os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
         settings.worker_timeout_seconds,
-        settings.max_request_bytes,
+        settings.max_encoded_output_bytes,
         generation_url=os.getenv(
             "IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"
         ),
@@ -374,6 +417,10 @@ def create_app(
 
     @app.exception_handler(LaneBusy)
     async def lane_busy(_: Request, exc: LaneBusy) -> JSONResponse:
+        logger.warning(
+            "GPU lane admission rejected",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         return JSONResponse(
             status_code=503,
             content={
@@ -383,6 +430,10 @@ def create_app(
 
     @app.exception_handler(ImageTooLarge)
     async def image_too_large(_: Request, exc: ImageTooLarge) -> JSONResponse:
+        logger.warning(
+            "image admission rejected by configured limit",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         return JSONResponse(
             {"error": {"code": "image_too_large", "message": "Image exceeds accepted limits"}},
             status_code=413,
@@ -390,6 +441,10 @@ def create_app(
 
     @app.exception_handler(InvalidImage)
     async def invalid_image(_: Request, exc: InvalidImage) -> JSONResponse:
+        logger.warning(
+            "image admission rejected invalid input",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         return JSONResponse(
             {"error": {"code": "invalid_image", "message": "Uploaded file is not a valid image"}},
             status_code=400,
@@ -438,12 +493,16 @@ def create_app(
         )
         capability_status["generation"] = generation_status
         capability_status["image-editing"] = editing_status
+        state_ready = state_write_ready(
+            settings.state_dir, settings.database_path, settings.source_dir
+        )
         return {
             "service": "image-api",
             "status": "ok"
-            if all(bool(v.get("ready")) for v in capability_status.values())
+            if state_ready and all(bool(v.get("ready")) for v in capability_status.values())
             else "degraded",
             "capabilities": capability_status,
+            "state": {"ready": state_ready},
             "gpuLane": lane.status(),
         }
 
@@ -499,26 +558,32 @@ def create_app(
     ) -> Response:
         if tile != 0 and tile % 32:
             raise HTTPException(422, "tile must be zero or a multiple of 32")
-        data = await _read_upload(file, settings.max_upload_bytes)
-        info = validate_image(
-            data,
-            max_bytes=settings.max_upload_bytes,
-            max_width=settings.max_input_width,
-            max_height=settings.max_input_height,
-            max_pixels=settings.max_input_pixels,
-        )
-        expected = (round(info.width * outscale), round(info.height * outscale))
-        if expected[0] * expected[1] > settings.max_output_pixels:
-            raise ImageTooLarge("upscaled output exceeds configured limits")
-        encoded = workers.upscale(data, model=model, outscale=outscale, tile=tile)
-        validate_png_output(
-            encoded,
-            expected_size=expected,
-            required_mode=None,
-            max_bytes=settings.max_request_bytes,
-            max_pixels=settings.max_output_pixels,
-        )
-        return Response(encoded, media_type="image/png")
+        info = await _validated_sync_upload(file, settings)
+        try:
+            expected = processing_output_size(info, outscale)
+            settings.admit_upscale_processing(info.width, info.height)
+            settings.admit_output_dimensions(*expected)
+        except BaseException:
+            await file.close()
+            raise
+        try:
+            encoded = workers.upscale(file.file, model=model, outscale=outscale, tile=tile)
+        finally:
+            await file.close()
+        try:
+            validate_png_output(
+                encoded,
+                expected_size=expected,
+                required_mode="RGB",
+                max_bytes=settings.max_encoded_output_bytes,
+                max_pixels=settings.max_output_pixels,
+                max_decoded_bytes=settings.max_decoded_output_bytes,
+            )
+        except Exception:
+            if not isinstance(encoded, bytes):
+                encoded.close()
+            raise
+        return _worker_image_response(encoded)
 
     @app.post("/v1/background-removal", response_class=Response)
     async def background_removal(
@@ -535,14 +600,12 @@ def create_app(
         birefnet_foreground_refinement: bool = False,
         model_input_size: Annotated[int, Query(ge=512, le=2048)] = 1024,
     ) -> Response:
-        data = await _read_upload(file, settings.max_upload_bytes)
-        info = validate_image(
-            data,
-            max_bytes=settings.max_upload_bytes,
-            max_width=settings.max_input_width,
-            max_height=settings.max_input_height,
-            max_pixels=settings.max_input_pixels,
-        )
+        info = await _validated_sync_upload(file, settings)
+        try:
+            settings.admit_output_dimensions(info.width, info.height)
+        except BaseException:
+            await file.close()
+            raise
         parameters = {
             "model": model,
             "alpha_blur": alpha_blur,
@@ -553,15 +616,24 @@ def create_app(
             "birefnet_foreground_refinement": birefnet_foreground_refinement,
             "model_input_size": model_input_size,
         }
-        encoded = workers.background(data, **parameters)
-        validate_png_output(
-            encoded,
-            expected_size=(info.width, info.height),
-            required_mode="RGBA",
-            max_bytes=settings.max_request_bytes,
-            max_pixels=settings.max_output_pixels,
-        )
-        return Response(encoded, media_type="image/png")
+        try:
+            encoded = workers.background(file.file, **parameters)
+        finally:
+            await file.close()
+        try:
+            validate_png_output(
+                encoded,
+                expected_size=(info.width, info.height),
+                required_mode="RGBA",
+                max_bytes=settings.max_encoded_output_bytes,
+                max_pixels=settings.max_output_pixels,
+                max_decoded_bytes=settings.max_decoded_output_bytes,
+            )
+        except Exception:
+            if not isinstance(encoded, bytes):
+                encoded.close()
+            raise
+        return _worker_image_response(encoded)
 
     @app.post("/v1/image-edits", status_code=202)
     async def admit_image_edit(
@@ -587,6 +659,7 @@ def create_app(
             max_width=settings.max_input_width,
             max_height=settings.max_input_height,
             max_pixels=settings.max_input_pixels,
+            max_decoded_bytes=settings.max_decoded_input_bytes,
         )
         original_hash = hashlib.sha256(data).hexdigest()
         normalized = _normalize_source(data)

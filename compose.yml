@@ -1,11 +1,28 @@
 name: image-api
 
 services:
+  state-init:
+    image: image-api-gateway:local
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    user: "0:0"
+    command: python -m image_api.state init
+    environment:
+      IMAGE_API_STATE_DIR: /state
+      IMAGE_API_STATE_UID: "10001"
+      IMAGE_API_STATE_GID: "10001"
+      IMAGE_API_STATE_INIT_MAX_ENTRIES: ${IMAGE_API_STATE_INIT_MAX_ENTRIES:-100000}
+    volumes:
+      - image-api-state:/state
+    restart: "no"
+
   image-api:
     image: image-api-gateway:local
     build:
       context: .
       dockerfile: Dockerfile.gateway
+    user: "10001:10001"
     ports:
       - "${IMAGE_API_BIND_ADDRESS:-0.0.0.0}:${IMAGE_API_PORT:-8000}:8000"
     environment:
@@ -19,10 +36,20 @@ services:
       IMAGE_API_LONGCAT_EDIT_REVISION: 7b54ef423aa7854be7861600024be5c56ab7875a
       IMAGE_API_LONGCAT_EDIT_TURBO_REVISION: 6a7262de5549f0bf0ec54c08ef7d283ef41f3214
       IMAGE_API_CUDA_AVAILABLE: "true"
-      IMAGE_API_MAX_REQUEST_BYTES: ${IMAGE_API_MAX_REQUEST_BYTES:-21000000}
-      IMAGE_API_MAX_UPLOAD_BYTES: ${IMAGE_API_MAX_UPLOAD_BYTES:-20000000}
-      IMAGE_API_MAX_INPUT_PIXELS: ${IMAGE_API_MAX_INPUT_PIXELS:-40000000}
-      IMAGE_API_MAX_OUTPUT_PIXELS: ${IMAGE_API_MAX_OUTPUT_PIXELS:-80000000}
+      IMAGE_API_MAX_REQUEST_BYTES: ${IMAGE_API_MAX_REQUEST_BYTES:-285000000}
+      IMAGE_API_MAX_UPLOAD_BYTES: ${IMAGE_API_MAX_UPLOAD_BYTES:-280000000}
+      IMAGE_API_MAX_ENCODED_OUTPUT_BYTES: ${IMAGE_API_MAX_ENCODED_OUTPUT_BYTES:-300000000}
+      IMAGE_API_MAX_INPUT_WIDTH: ${IMAGE_API_MAX_INPUT_WIDTH:-8192}
+      IMAGE_API_MAX_INPUT_HEIGHT: ${IMAGE_API_MAX_INPUT_HEIGHT:-8192}
+      IMAGE_API_MAX_INPUT_PIXELS: ${IMAGE_API_MAX_INPUT_PIXELS:-67108864}
+      IMAGE_API_MAX_OUTPUT_PIXELS: ${IMAGE_API_MAX_OUTPUT_PIXELS:-67108864}
+      IMAGE_API_MAX_DECODED_INPUT_BYTES: ${IMAGE_API_MAX_DECODED_INPUT_BYTES:-268435456}
+      IMAGE_API_MAX_DECODED_OUTPUT_BYTES: ${IMAGE_API_MAX_DECODED_OUTPUT_BYTES:-268435456}
+      IMAGE_API_MAX_PROCESSING_WIDTH: ${IMAGE_API_MAX_PROCESSING_WIDTH:-16384}
+      IMAGE_API_MAX_PROCESSING_HEIGHT: ${IMAGE_API_MAX_PROCESSING_HEIGHT:-16384}
+      IMAGE_API_MAX_PROCESSING_PIXELS: ${IMAGE_API_MAX_PROCESSING_PIXELS:-268435456}
+      IMAGE_API_MAX_PROCESSING_BYTES: ${IMAGE_API_MAX_PROCESSING_BYTES:-3221225472}
+      IMAGE_API_WORKER_TIMEOUT_SECONDS: ${IMAGE_API_WORKER_TIMEOUT_SECONDS:-900}
       IMAGE_API_MAX_QUEUE_DEPTH: ${IMAGE_API_MAX_QUEUE_DEPTH:-100}
       IMAGE_API_MAGIC_PROMPT_BACKEND: ${IMAGE_API_MAGIC_PROMPT_BACKEND:-}
     volumes:
@@ -31,6 +58,8 @@ services:
       - ${IMAGE_API_LONGCAT_EDIT_WEIGHTS_HOST_PATH:-./models/longcat-image-edit}:/models/longcat-image-edit:ro
       - ${IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_HOST_PATH:-./models/longcat-image-edit-turbo}:/models/longcat-image-edit-turbo:ro
     depends_on:
+      state-init:
+        condition: service_completed_successfully
       upscale-worker:
         condition: service_healthy
       background-worker:
@@ -54,16 +83,33 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.upscale
+    user: "10001:10001"
     expose:
       - "9001"
     environment:
       IMAGE_API_UPSCALE_WEIGHTS_PATH: /models/upscale
+      IMAGE_API_STATE_DIR: /state
+      IMAGE_API_MAX_UPLOAD_BYTES: ${IMAGE_API_MAX_UPLOAD_BYTES:-280000000}
+      IMAGE_API_MAX_ENCODED_OUTPUT_BYTES: ${IMAGE_API_MAX_ENCODED_OUTPUT_BYTES:-300000000}
+      IMAGE_API_MAX_INPUT_WIDTH: ${IMAGE_API_MAX_INPUT_WIDTH:-8192}
+      IMAGE_API_MAX_INPUT_HEIGHT: ${IMAGE_API_MAX_INPUT_HEIGHT:-8192}
+      IMAGE_API_MAX_INPUT_PIXELS: ${IMAGE_API_MAX_INPUT_PIXELS:-67108864}
+      IMAGE_API_MAX_OUTPUT_PIXELS: ${IMAGE_API_MAX_OUTPUT_PIXELS:-67108864}
+      IMAGE_API_MAX_DECODED_INPUT_BYTES: ${IMAGE_API_MAX_DECODED_INPUT_BYTES:-268435456}
+      IMAGE_API_MAX_DECODED_OUTPUT_BYTES: ${IMAGE_API_MAX_DECODED_OUTPUT_BYTES:-268435456}
+      IMAGE_API_MAX_PROCESSING_WIDTH: ${IMAGE_API_MAX_PROCESSING_WIDTH:-16384}
+      IMAGE_API_MAX_PROCESSING_HEIGHT: ${IMAGE_API_MAX_PROCESSING_HEIGHT:-16384}
+      IMAGE_API_MAX_PROCESSING_PIXELS: ${IMAGE_API_MAX_PROCESSING_PIXELS:-268435456}
+      IMAGE_API_MAX_PROCESSING_BYTES: ${IMAGE_API_MAX_PROCESSING_BYTES:-3221225472}
       IMAGE_API_BACKGROUND_WORKER_URL: http://background-worker:9002
       IMAGE_API_GENERATION_WORKER_URL: http://generation-worker:9003
     volumes:
       - ${IMAGE_API_UPSCALE_WEIGHTS_HOST_PATH:-./models/upscale}:/models/upscale:ro
       - image-api-state:/state
     gpus: all
+    depends_on:
+      state-init:
+        condition: service_completed_successfully
     healthcheck:
       test:
         - CMD
@@ -81,12 +127,26 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.background
+    user: "10001:10001"
     expose:
       - "9002"
     environment:
       IMAGE_API_BRIA_WEIGHTS_PATH: /models/bria-rmbg-2.0
       IMAGE_API_BIREFNET_WEIGHTS_PATH: /models/birefnet-hr
       IMAGE_API_BIREFNET_REVISION: 5d6b6f8adcb5b417c871b1d84ceaae9871355b7f
+      IMAGE_API_STATE_DIR: /state
+      IMAGE_API_MAX_UPLOAD_BYTES: ${IMAGE_API_MAX_UPLOAD_BYTES:-280000000}
+      IMAGE_API_MAX_ENCODED_OUTPUT_BYTES: ${IMAGE_API_MAX_ENCODED_OUTPUT_BYTES:-300000000}
+      IMAGE_API_MAX_INPUT_WIDTH: ${IMAGE_API_MAX_INPUT_WIDTH:-8192}
+      IMAGE_API_MAX_INPUT_HEIGHT: ${IMAGE_API_MAX_INPUT_HEIGHT:-8192}
+      IMAGE_API_MAX_INPUT_PIXELS: ${IMAGE_API_MAX_INPUT_PIXELS:-67108864}
+      IMAGE_API_MAX_OUTPUT_PIXELS: ${IMAGE_API_MAX_OUTPUT_PIXELS:-67108864}
+      IMAGE_API_MAX_DECODED_INPUT_BYTES: ${IMAGE_API_MAX_DECODED_INPUT_BYTES:-268435456}
+      IMAGE_API_MAX_DECODED_OUTPUT_BYTES: ${IMAGE_API_MAX_DECODED_OUTPUT_BYTES:-268435456}
+      IMAGE_API_MAX_PROCESSING_WIDTH: ${IMAGE_API_MAX_PROCESSING_WIDTH:-16384}
+      IMAGE_API_MAX_PROCESSING_HEIGHT: ${IMAGE_API_MAX_PROCESSING_HEIGHT:-16384}
+      IMAGE_API_MAX_PROCESSING_PIXELS: ${IMAGE_API_MAX_PROCESSING_PIXELS:-268435456}
+      IMAGE_API_MAX_PROCESSING_BYTES: ${IMAGE_API_MAX_PROCESSING_BYTES:-3221225472}
       IMAGE_API_UPSCALE_WORKER_URL: http://upscale-worker:9001
       IMAGE_API_GENERATION_WORKER_URL: http://generation-worker:9003
     volumes:
@@ -94,6 +154,9 @@ services:
       - ${IMAGE_API_BIREFNET_WEIGHTS_HOST_PATH:-./models/birefnet-hr}:/models/birefnet-hr:ro
       - image-api-state:/state
     gpus: all
+    depends_on:
+      state-init:
+        condition: service_completed_successfully
     healthcheck:
       test:
         - CMD
@@ -111,6 +174,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.generation
+    user: "10001:10001"
     expose:
       - "9003"
     environment:
@@ -133,6 +197,9 @@ services:
       - ${IMAGE_API_LONGCAT_EDIT_WEIGHTS_HOST_PATH:-./models/longcat-image-edit}:/models/longcat-image-edit:ro
       - ${IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_HOST_PATH:-./models/longcat-image-edit-turbo}:/models/longcat-image-edit-turbo:ro
     gpus: all
+    depends_on:
+      state-init:
+        condition: service_completed_successfully
     healthcheck:
       test:
         - CMD

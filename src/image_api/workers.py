@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import logging
 from io import BytesIO
-from typing import Protocol
+from tempfile import SpooledTemporaryFile
+from typing import IO, Protocol, TypeAlias
 
 import httpx
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+WorkerInput: TypeAlias = bytes | IO[bytes]
+WorkerOutput: TypeAlias = bytes | IO[bytes]
+OUTPUT_SPOOL_MEMORY_BYTES = 8 * 1024 * 1024
 
 
 class WorkerUnavailable(RuntimeError):
@@ -19,8 +23,8 @@ class WorkerClient(Protocol):
     model_loads: int
 
     def health(self) -> dict[str, dict[str, object]]: ...
-    def upscale(self, data: bytes, **parameters: object) -> bytes: ...
-    def background(self, data: bytes, **parameters: object) -> bytes: ...
+    def upscale(self, data: WorkerInput, **parameters: object) -> WorkerOutput: ...
+    def background(self, data: WorkerInput, **parameters: object) -> WorkerOutput: ...
     def unload_all(self) -> dict[str, dict[str, object]]: ...
 
 
@@ -111,8 +115,11 @@ class HttpWorkerClient:
                 results[name] = {"unloaded": False, "error": "worker_unavailable"}
         return results
 
-    def _post(self, url: str, data: bytes, parameters: dict[str, object]) -> bytes:
+    def _post(self, url: str, data: WorkerInput, parameters: dict[str, object]) -> IO[bytes]:
+        output: IO[bytes] | None = None
         try:
+            if not isinstance(data, bytes):
+                data.seek(0)
             with self.client.stream(
                 "POST",
                 url,
@@ -126,19 +133,24 @@ class HttpWorkerClient:
                 if declared is not None and declared.isdigit():
                     if int(declared) > self.max_output_bytes:
                         raise WorkerUnavailable("worker output exceeds configured limit")
-                output = bytearray()
+                output = SpooledTemporaryFile(max_size=OUTPUT_SPOOL_MEMORY_BYTES, mode="w+b")
+                total = 0
                 for chunk in response.iter_bytes():
-                    if len(chunk) > self.max_output_bytes - len(output):
+                    if len(chunk) > self.max_output_bytes - total:
                         raise WorkerUnavailable("worker output exceeds configured limit")
-                    output.extend(chunk)
-                return bytes(output)
+                    output.write(chunk)
+                    total += len(chunk)
+                output.seek(0)
+                return output
         except Exception as exc:
+            if output is not None:
+                output.close()
             raise WorkerUnavailable("worker request failed") from exc
 
-    def upscale(self, data: bytes, **parameters: object) -> bytes:
+    def upscale(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
         return self._post(f"{self.upscale_url}/internal/upscale", data, parameters)
 
-    def background(self, data: bytes, **parameters: object) -> bytes:
+    def background(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
         return self._post(f"{self.background_url}/internal/background-removal", data, parameters)
 
 
@@ -205,15 +217,18 @@ class FakeWorkerClient:
         return {name: {"unloaded": True} for name in self._loaded}
 
     @staticmethod
-    def _open(data: bytes) -> Image.Image:
-        with Image.open(BytesIO(data)) as image:
+    def _open(data: WorkerInput) -> Image.Image:
+        stream = BytesIO(data) if isinstance(data, bytes) else data
+        if not isinstance(data, bytes):
+            stream.seek(0)
+        with Image.open(stream) as image:
             return image.copy()
 
-    def upscale(self, data: bytes, **parameters: object) -> bytes:
+    def upscale(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
         self.model_invocations += 1
         self.last_upscale = parameters
         opened = self._open(data)
-        image = opened.convert("RGBA" if opened.mode == "RGBA" else "RGB")
+        image = opened.convert("RGB")
         scale_value = parameters["outscale"]
         if not isinstance(scale_value, (int, float)):
             raise ValueError("fake worker outscale must be numeric")
@@ -223,7 +238,7 @@ class FakeWorkerClient:
         image.save(output, "PNG")
         return output.getvalue()
 
-    def background(self, data: bytes, **parameters: object) -> bytes:
+    def background(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
         self.model_invocations += 1
         self.last_background = parameters
         image = self._open(data).convert("RGBA")

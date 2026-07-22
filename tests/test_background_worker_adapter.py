@@ -162,3 +162,32 @@ def test_switching_remaining_models_releases_resident_model(monkeypatch, tmp_pat
         "clear-bria",
         "birefnet",
     ]
+
+
+def test_background_postprocessing_uses_configured_encoded_ceiling(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    _install_pr7_fakes(monkeypatch, calls)
+    monkeypatch.setenv("IMAGE_API_MAX_ENCODED_OUTPUT_BYTES", "345000000")
+    observed: dict[str, object] = {}
+    processing = sys.modules["rembg_api.image_processing"]
+
+    def process(data: bytes, **kwargs: object) -> bytes:
+        observed.update(kwargs)
+        return data
+
+    processing.process_png_bytes = process  # type: ignore[attr-defined]
+
+    encoded = background._run_background(
+        png("RGB", (13, 7)),
+        model="birefnet-hr-matting",
+        alpha_blur=0,
+        alpha_erode=0,
+        alpha_dilate=0,
+        alpha_threshold=0,
+        birefnet_inference_size=4096,
+        birefnet_foreground_refinement=False,
+        model_input_size=1024,
+    )
+
+    assert observed["max_encoded_bytes"] == 345_000_000
+    assert encoded == png("RGBA", (13, 7))

@@ -4,11 +4,19 @@ import json
 import os
 import re
 from dataclasses import dataclass, replace
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
 REPOSITORY_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SNAPSHOT_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
+SQUARE_8K_EDGE = 8192
+SQUARE_8K_PIXELS = SQUARE_8K_EDGE * SQUARE_8K_EDGE
+SQUARE_8K_RGBA_BYTES = SQUARE_8K_PIXELS * 4
+UPSCALE_NATIVE_SCALE = 4
+SQUARE_16K_EDGE = SQUARE_8K_EDGE * 2
+SQUARE_16K_PIXELS = SQUARE_16K_EDGE * SQUARE_16K_EDGE
+SQUARE_16K_RGB_FLOAT_BYTES = SQUARE_16K_PIXELS * 3 * 4
 LONGCAT_EDIT_REVISION = "7b54ef423aa7854be7861600024be5c56ab7875a"
 LONGCAT_EDIT_TURBO_REVISION = "6a7262de5549f0bf0ec54c08ef7d283ef41f3214"
 
@@ -144,14 +152,21 @@ class Settings:
     longcat_edit_turbo_weights_path: Path
     longcat_edit_revision: str = LONGCAT_EDIT_REVISION
     longcat_edit_turbo_revision: str = LONGCAT_EDIT_TURBO_REVISION
-    max_request_bytes: int = 21_000_000
-    max_upload_bytes: int = 20_000_000
-    max_input_width: int = 10_000
-    max_input_height: int = 10_000
-    max_input_pixels: int = 40_000_000
-    max_output_pixels: int = 80_000_000
+    max_request_bytes: int = 285_000_000
+    max_upload_bytes: int = 280_000_000
+    max_encoded_output_bytes: int = 300_000_000
+    max_input_width: int = SQUARE_8K_EDGE
+    max_input_height: int = SQUARE_8K_EDGE
+    max_input_pixels: int = SQUARE_8K_PIXELS
+    max_output_pixels: int = SQUARE_8K_PIXELS
+    max_decoded_input_bytes: int = SQUARE_8K_RGBA_BYTES
+    max_decoded_output_bytes: int = SQUARE_8K_RGBA_BYTES
+    max_processing_width: int = SQUARE_16K_EDGE
+    max_processing_height: int = SQUARE_16K_EDGE
+    max_processing_pixels: int = SQUARE_16K_PIXELS
+    max_processing_bytes: int = SQUARE_16K_RGB_FLOAT_BYTES
     max_queue_depth: int = 100
-    worker_timeout_seconds: float = 120.0
+    worker_timeout_seconds: float = 900.0
     lane_timeout_seconds: float = 2.0
     generation_heartbeat_max_age_seconds: float = 15.0
     magic_prompt_backend: str | None = None
@@ -186,14 +201,35 @@ class Settings:
             longcat_edit_turbo_revision=os.getenv(
                 "IMAGE_API_LONGCAT_EDIT_TURBO_REVISION", LONGCAT_EDIT_TURBO_REVISION
             ),
-            max_request_bytes=int(os.getenv("IMAGE_API_MAX_REQUEST_BYTES", "21000000")),
-            max_upload_bytes=int(os.getenv("IMAGE_API_MAX_UPLOAD_BYTES", "20000000")),
-            max_input_width=int(os.getenv("IMAGE_API_MAX_INPUT_WIDTH", "10000")),
-            max_input_height=int(os.getenv("IMAGE_API_MAX_INPUT_HEIGHT", "10000")),
-            max_input_pixels=int(os.getenv("IMAGE_API_MAX_INPUT_PIXELS", "40000000")),
-            max_output_pixels=int(os.getenv("IMAGE_API_MAX_OUTPUT_PIXELS", "80000000")),
+            max_request_bytes=int(os.getenv("IMAGE_API_MAX_REQUEST_BYTES", "285000000")),
+            max_upload_bytes=int(os.getenv("IMAGE_API_MAX_UPLOAD_BYTES", "280000000")),
+            max_encoded_output_bytes=int(
+                os.getenv("IMAGE_API_MAX_ENCODED_OUTPUT_BYTES", "300000000")
+            ),
+            max_input_width=int(os.getenv("IMAGE_API_MAX_INPUT_WIDTH", str(SQUARE_8K_EDGE))),
+            max_input_height=int(os.getenv("IMAGE_API_MAX_INPUT_HEIGHT", str(SQUARE_8K_EDGE))),
+            max_input_pixels=int(os.getenv("IMAGE_API_MAX_INPUT_PIXELS", str(SQUARE_8K_PIXELS))),
+            max_output_pixels=int(os.getenv("IMAGE_API_MAX_OUTPUT_PIXELS", str(SQUARE_8K_PIXELS))),
+            max_decoded_input_bytes=int(
+                os.getenv("IMAGE_API_MAX_DECODED_INPUT_BYTES", str(SQUARE_8K_RGBA_BYTES))
+            ),
+            max_decoded_output_bytes=int(
+                os.getenv("IMAGE_API_MAX_DECODED_OUTPUT_BYTES", str(SQUARE_8K_RGBA_BYTES))
+            ),
+            max_processing_width=int(
+                os.getenv("IMAGE_API_MAX_PROCESSING_WIDTH", str(SQUARE_16K_EDGE))
+            ),
+            max_processing_height=int(
+                os.getenv("IMAGE_API_MAX_PROCESSING_HEIGHT", str(SQUARE_16K_EDGE))
+            ),
+            max_processing_pixels=int(
+                os.getenv("IMAGE_API_MAX_PROCESSING_PIXELS", str(SQUARE_16K_PIXELS))
+            ),
+            max_processing_bytes=int(
+                os.getenv("IMAGE_API_MAX_PROCESSING_BYTES", str(SQUARE_16K_RGB_FLOAT_BYTES))
+            ),
             max_queue_depth=int(os.getenv("IMAGE_API_MAX_QUEUE_DEPTH", "100")),
-            worker_timeout_seconds=float(os.getenv("IMAGE_API_WORKER_TIMEOUT_SECONDS", "120")),
+            worker_timeout_seconds=float(os.getenv("IMAGE_API_WORKER_TIMEOUT_SECONDS", "900")),
             lane_timeout_seconds=float(os.getenv("IMAGE_API_LANE_TIMEOUT_SECONDS", "2")),
             generation_heartbeat_max_age_seconds=float(
                 os.getenv("IMAGE_API_GENERATION_HEARTBEAT_MAX_AGE_SECONDS", "15")
@@ -209,26 +245,63 @@ class Settings:
         positive = {
             "IMAGE_API_MAX_REQUEST_BYTES": self.max_request_bytes,
             "IMAGE_API_MAX_UPLOAD_BYTES": self.max_upload_bytes,
+            "IMAGE_API_MAX_ENCODED_OUTPUT_BYTES": self.max_encoded_output_bytes,
             "IMAGE_API_MAX_INPUT_WIDTH": self.max_input_width,
             "IMAGE_API_MAX_INPUT_HEIGHT": self.max_input_height,
             "IMAGE_API_MAX_INPUT_PIXELS": self.max_input_pixels,
             "IMAGE_API_MAX_OUTPUT_PIXELS": self.max_output_pixels,
+            "IMAGE_API_MAX_DECODED_INPUT_BYTES": self.max_decoded_input_bytes,
+            "IMAGE_API_MAX_DECODED_OUTPUT_BYTES": self.max_decoded_output_bytes,
+            "IMAGE_API_MAX_PROCESSING_WIDTH": self.max_processing_width,
+            "IMAGE_API_MAX_PROCESSING_HEIGHT": self.max_processing_height,
+            "IMAGE_API_MAX_PROCESSING_PIXELS": self.max_processing_pixels,
+            "IMAGE_API_MAX_PROCESSING_BYTES": self.max_processing_bytes,
             "IMAGE_API_MAX_QUEUE_DEPTH": self.max_queue_depth,
         }
         if any(value < 1 for value in positive.values()):
             raise ValueError("image-api limits must be positive")
         if self.max_request_bytes < self.max_upload_bytes:
             raise ValueError("IMAGE_API_MAX_REQUEST_BYTES must cover IMAGE_API_MAX_UPLOAD_BYTES")
-        if (
-            self.worker_timeout_seconds <= 0
-            or self.lane_timeout_seconds <= 0
-            or self.generation_heartbeat_max_age_seconds <= 0
-        ):
-            raise ValueError("image-api timeouts must be positive")
+        timeouts = (
+            self.worker_timeout_seconds,
+            self.lane_timeout_seconds,
+            self.generation_heartbeat_max_age_seconds,
+        )
+        if any(not isfinite(value) or value <= 0 for value in timeouts):
+            raise ValueError("image-api timeouts must be finite and positive")
         if not SNAPSHOT_PATTERN.fullmatch(
             self.longcat_edit_revision
         ) or not SNAPSHOT_PATTERN.fullmatch(self.longcat_edit_turbo_revision):
             raise ValueError("LongCat revisions must be immutable commit hashes")
+
+    def admit_output_dimensions(self, width: int, height: int) -> tuple[int, int]:
+        from image_api.images import validate_dimensions
+
+        validate_dimensions(
+            width,
+            height,
+            max_width=self.max_input_width,
+            max_height=self.max_input_height,
+            max_pixels=self.max_output_pixels,
+            max_decoded_bytes=self.max_decoded_output_bytes,
+        )
+        return width, height
+
+    def admit_upscale_processing(self, width: int, height: int) -> tuple[int, int]:
+        from image_api.images import ImageTooLarge
+
+        native_width = width * UPSCALE_NATIVE_SCALE
+        native_height = height * UPSCALE_NATIVE_SCALE
+        native_pixels = native_width * native_height
+        if (
+            native_width > self.max_processing_width
+            or native_height > self.max_processing_height
+            or native_pixels > self.max_processing_pixels
+        ):
+            raise ImageTooLarge("Real-ESRGAN native processing dimensions exceed configured limits")
+        if native_pixels * 3 * 4 > self.max_processing_bytes:
+            raise ImageTooLarge("Real-ESRGAN native processing memory exceeds configured limit")
+        return native_width, native_height
 
     @classmethod
     def for_tests(cls, root: Path, **overrides: Any) -> Settings:
@@ -244,8 +317,11 @@ class Settings:
             longcat_edit_turbo_weights_path=root / "longcat-edit-turbo-weights",
             max_upload_bytes=1_000_000,
             max_request_bytes=1_100_000,
+            max_encoded_output_bytes=1_000_000,
             max_input_pixels=1_000_000,
             max_output_pixels=4_000_000,
+            max_decoded_input_bytes=4_000_000,
+            max_decoded_output_bytes=16_000_000,
             cuda_available=True,
             generation_test_mode=True,
         )

@@ -1,7 +1,9 @@
 FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-RUN apt-get update && apt-get install -y --no-install-recommends git libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git libgl1 libglib2.0-0 && \
+    groupadd --gid 10001 image-api && useradd --create-home --uid 10001 --gid 10001 image-api && \
+    mkdir -p /state && chown 10001:10001 /state && rm -rf /var/lib/apt/lists/*
 WORKDIR /srv/image-api
 COPY pyproject.toml README.md LICENSE NOTICE.md ./
 COPY licenses ./licenses
@@ -10,5 +12,6 @@ RUN pip install --no-cache-dir . numpy opencv-python-headless basicsr==1.4.2 fac
     python -c "from pathlib import Path; import sysconfig; p=Path(sysconfig.get_paths()['purelib'])/'basicsr/data/degradations.py'; p.write_text(p.read_text().replace('from torchvision.transforms.functional_tensor import rgb_to_grayscale', 'from torchvision.transforms.functional import rgb_to_grayscale'))" && \
     pip install --no-cache-dir --no-deps \
     "git+https://github.com/xinntao/Real-ESRGAN.git@fa4c8a03ae3dbc9ea6ed471a6ab5da94ac15c2ea"
+USER 10001:10001
 EXPOSE 9001
 CMD ["uvicorn", "image_api_workers.upscale:app", "--host", "0.0.0.0", "--port", "9001"]
