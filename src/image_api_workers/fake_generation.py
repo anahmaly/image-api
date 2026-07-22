@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from PIL import Image
 
+from image_api.config import Settings
 from image_api.generation import GenerationRunner, recover_interrupted_tasks, start_worker_heartbeat
 from image_api.lane import GpuLane
 from image_api.store import TaskStore
@@ -49,11 +50,18 @@ def _serve() -> None:
 
 
 def main() -> None:
-    state = Path(os.getenv("IMAGE_API_STATE_DIR", "/state"))
-    start_worker_heartbeat(state / "generation-worker.heartbeat")
+    settings = Settings.from_env()
+    state = settings.state_dir
+    start_worker_heartbeat(settings.generation_heartbeat_path)
     threading.Thread(target=_serve, name="fake-generation-control", daemon=True).start()
-    store = TaskStore(state / "tasks.sqlite3")
-    recover_interrupted_tasks(store, state / "outputs", state / "sources")
+    store = TaskStore(
+        settings.database_path,
+        settings.max_queue_depth,
+        processing_max_persisted_output_bytes=settings.processing_max_persisted_output_bytes,
+        processing_max_encoded_output_bytes=settings.processing_max_encoded_output_bytes,
+        output_dir=settings.output_dir,
+    )
+    recover_interrupted_tasks(store, settings.output_dir, settings.source_dir)
     runner = GenerationRunner(
         store,
         GpuLane(state / "gpu-lane.lock", 30),

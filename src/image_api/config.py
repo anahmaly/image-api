@@ -165,6 +165,7 @@ class Settings:
     processing_max_request_bytes: int = 285_000_000
     processing_max_upload_bytes: int = 280_000_000
     processing_max_encoded_output_bytes: int = 300_000_000
+    processing_max_persisted_output_bytes: int = 18_000_000_000
     processing_max_input_width: int = SQUARE_8K_EDGE
     processing_max_input_height: int = SQUARE_8K_EDGE
     processing_max_input_pixels: int = SQUARE_8K_PIXELS
@@ -236,6 +237,9 @@ class Settings:
             processing_max_encoded_output_bytes=int(
                 os.getenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "300000000")
             ),
+            processing_max_persisted_output_bytes=int(
+                os.getenv("IMAGE_API_PROCESSING_MAX_PERSISTED_OUTPUT_BYTES", "18000000000")
+            ),
             processing_max_input_width=int(
                 os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_WIDTH", str(SQUARE_8K_EDGE))
             ),
@@ -295,6 +299,9 @@ class Settings:
             "IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES": self.processing_max_upload_bytes,
             "IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES": (
                 self.processing_max_encoded_output_bytes
+            ),
+            "IMAGE_API_PROCESSING_MAX_PERSISTED_OUTPUT_BYTES": (
+                self.processing_max_persisted_output_bytes
             ),
             "IMAGE_API_PROCESSING_MAX_INPUT_WIDTH": self.processing_max_input_width,
             "IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT": self.processing_max_input_height,
@@ -383,6 +390,7 @@ class Settings:
             processing_max_upload_bytes=1_000_000,
             processing_max_request_bytes=1_100_000,
             processing_max_encoded_output_bytes=1_000_000,
+            processing_max_persisted_output_bytes=60_000_000,
             processing_max_input_pixels=1_000_000,
             processing_max_output_pixels=4_000_000,
             processing_max_decoded_input_bytes=4_000_000,

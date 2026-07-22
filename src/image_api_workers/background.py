@@ -229,7 +229,13 @@ def start_durable_runner() -> bool:
 
     def build_runner() -> ProcessingRunner:
         settings = Settings.from_env()
-        store = TaskStore(settings.database_path, settings.max_queue_depth)
+        store = TaskStore(
+            settings.database_path,
+            settings.max_queue_depth,
+            processing_max_persisted_output_bytes=settings.processing_max_persisted_output_bytes,
+            processing_max_encoded_output_bytes=settings.processing_max_encoded_output_bytes,
+            output_dir=settings.output_dir,
+        )
         recovered = recover_processing_tasks(
             "background-removal", store, settings.output_dir, settings.source_dir, settings
         )

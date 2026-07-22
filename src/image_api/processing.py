@@ -119,6 +119,16 @@ def _processing_contract(task: TaskRecord) -> tuple[tuple[int, int], str]:
     return (width, height), mode
 
 
+def _processing_output_limit(task: TaskRecord, settings: Settings) -> int:
+    reserved = task.output_reserved_bytes
+    reservation = (
+        reserved
+        if type(reserved) is int and reserved > 0
+        else settings.processing_max_encoded_output_bytes
+    )
+    return min(reservation, settings.processing_max_encoded_output_bytes)
+
+
 def _sha256_file(path: Path, max_bytes: int) -> str:
     digest = hashlib.sha256()
     total = 0
@@ -164,25 +174,26 @@ def validate_processing_output(
     path: Path, task: TaskRecord, settings: Settings
 ) -> tuple[str, ImageInfo]:
     expected, required_mode = _processing_contract(task)
+    output_limit = _processing_output_limit(task, settings)
     with path.open("rb") as handle:
         validate_png_output(
             handle,
             expected_size=expected,
             required_mode=required_mode,
-            max_bytes=settings.processing_max_encoded_output_bytes,
+            max_bytes=output_limit,
             max_pixels=settings.processing_max_output_pixels,
             max_decoded_bytes=settings.processing_max_decoded_output_bytes,
         )
         info = validate_image(
             handle,
-            max_bytes=settings.processing_max_encoded_output_bytes,
+            max_bytes=output_limit,
             max_width=expected[0],
             max_height=expected[1],
             max_pixels=settings.processing_max_output_pixels,
             max_decoded_bytes=settings.processing_max_decoded_output_bytes,
             worker_output=True,
         )
-    return _sha256_file(path, settings.processing_max_encoded_output_bytes), info
+    return _sha256_file(path, output_limit), info
 
 
 def reconcile_processing_task(
@@ -213,6 +224,7 @@ def reconcile_processing_task(
         output_width=info.width,
         output_height=info.height,
         output_mode=info.mode,
+        output_size_bytes=final_path.stat().st_size,
     )
     if reconciled:
         _clean_task_files(output_dir, task_id, remove_final=False)
@@ -272,9 +284,10 @@ class ProcessingRunner:
         final_path = self.output_dir / f"{task.task_id}.png"
         source: BinaryIO | None = None
         try:
+            output_limit = _processing_output_limit(task, self.settings)
             with temporary.open("xb") as target:
                 if isinstance(encoded, bytes):
-                    if len(encoded) > self.settings.processing_max_encoded_output_bytes:
+                    if len(encoded) > output_limit:
                         raise ValueError("processing output exceeds configured limit")
                     target.write(encoded)
                 else:
@@ -283,7 +296,7 @@ class ProcessingRunner:
                     total = 0
                     while chunk := source.read(_CHUNK_BYTES):
                         total += len(chunk)
-                        if total > self.settings.processing_max_encoded_output_bytes:
+                        if total > output_limit:
                             raise ValueError("processing output exceeds configured limit")
                         target.write(chunk)
                 target.flush()
@@ -319,6 +332,7 @@ class ProcessingRunner:
                 output_width=info.width,
                 output_height=info.height,
                 output_mode=info.mode,
+                output_size_bytes=final_path.stat().st_size,
             )
             _cleanup_task_source(self.store, task.task_id, self.source_dir)
         except Exception as exc:

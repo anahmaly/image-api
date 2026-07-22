@@ -32,7 +32,14 @@ from image_api.images import (
 from image_api.lane import GpuLane, LaneBusy
 from image_api.processing import validate_processing_output
 from image_api.state import state_write_ready
-from image_api.store import IdempotencyConflict, QueueFull, TaskKind, TaskRecord, TaskStore
+from image_api.store import (
+    IdempotencyConflict,
+    PersistedOutputQuotaExceeded,
+    QueueFull,
+    TaskKind,
+    TaskRecord,
+    TaskStore,
+)
 from image_api.workers import HttpWorkerClient, WorkerClient, WorkerUnavailable
 
 logger = logging.getLogger(__name__)
@@ -484,7 +491,13 @@ def create_app(
     settings.state_dir.mkdir(parents=True, exist_ok=True)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     settings.source_dir.mkdir(parents=True, exist_ok=True)
-    store = store or TaskStore(settings.database_path, settings.max_queue_depth)
+    store = store or TaskStore(
+        settings.database_path,
+        settings.max_queue_depth,
+        processing_max_persisted_output_bytes=settings.processing_max_persisted_output_bytes,
+        processing_max_encoded_output_bytes=settings.processing_max_encoded_output_bytes,
+        output_dir=settings.output_dir,
+    )
     workers = workers or HttpWorkerClient(
         os.getenv("IMAGE_API_UPSCALE_WORKER_URL", "http://upscale-worker:9001"),
         os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
@@ -704,6 +717,10 @@ def create_app(
                 if not source_existed:
                     _remove_orphan_source(settings.source_dir, source_name, store)
                 raise HTTPException(409, "idempotency key conflicts with another request") from exc
+            except PersistedOutputQuotaExceeded as exc:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise HTTPException(507, "persisted processing output quota is full") from exc
             except QueueFull as exc:
                 if not source_existed:
                     _remove_orphan_source(settings.source_dir, source_name, store)
@@ -778,6 +795,10 @@ def create_app(
                 if not source_existed:
                     _remove_orphan_source(settings.source_dir, source_name, store)
                 raise HTTPException(409, "idempotency key conflicts with another request") from exc
+            except PersistedOutputQuotaExceeded as exc:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise HTTPException(507, "persisted processing output quota is full") from exc
             except QueueFull as exc:
                 if not source_existed:
                     _remove_orphan_source(settings.source_dir, source_name, store)

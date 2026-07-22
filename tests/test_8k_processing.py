@@ -48,6 +48,7 @@ def test_8k_defaults_are_processing_only_and_cover_rgba_contract(
         "IMAGE_API_PROCESSING_MAX_REQUEST_BYTES",
         "IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES",
         "IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES",
+        "IMAGE_API_PROCESSING_MAX_PERSISTED_OUTPUT_BYTES",
         "IMAGE_API_PROCESSING_MAX_INPUT_WIDTH",
         "IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT",
         "IMAGE_API_PROCESSING_MAX_INPUT_PIXELS",
@@ -79,12 +80,14 @@ def test_8k_defaults_are_processing_only_and_cover_rgba_contract(
     assert settings.admit_upscale_processing(SQUARE_4K, SQUARE_4K) == (16384, 16384)
     assert settings.processing_max_request_bytes > settings.processing_max_upload_bytes
     assert settings.processing_max_encoded_output_bytes > 40_000_000
+    assert settings.processing_max_persisted_output_bytes == 18_000_000_000
     assert settings.worker_timeout_seconds >= 600
 
 
 def test_8k_limits_and_timeout_accept_environment_overrides(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("IMAGE_API_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "345000000")
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_PERSISTED_OUTPUT_BYTES", "19000000000")
     monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_DECODED_INPUT_BYTES", "300000000")
     monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_DECODED_OUTPUT_BYTES", "310000000")
     monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_NATIVE_BYTES", "4000000000")
@@ -93,6 +96,7 @@ def test_8k_limits_and_timeout_accept_environment_overrides(monkeypatch, tmp_pat
     settings = Settings.from_env()
 
     assert settings.processing_max_encoded_output_bytes == 345_000_000
+    assert settings.processing_max_persisted_output_bytes == 19_000_000_000
     assert settings.processing_max_decoded_input_bytes == 300_000_000
     assert settings.processing_max_decoded_output_bytes == 310_000_000
     assert settings.processing_max_native_bytes == 4_000_000_000
@@ -100,6 +104,11 @@ def test_8k_limits_and_timeout_accept_environment_overrides(monkeypatch, tmp_pat
 
     monkeypatch.setenv("IMAGE_API_WORKER_TIMEOUT_SECONDS", "nan")
     with pytest.raises(ValueError, match="finite"):
+        Settings.from_env()
+
+    monkeypatch.setenv("IMAGE_API_WORKER_TIMEOUT_SECONDS", "1234")
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_PERSISTED_OUTPUT_BYTES", "0")
+    with pytest.raises(ValueError, match="positive"):
         Settings.from_env()
 
 
@@ -225,6 +234,18 @@ def test_worker_output_requires_exact_dimensions_and_rgb_for_upscale() -> None:
             max_pixels=64,
             max_decoded_bytes=256,
         )
+
+
+def test_persisted_processing_quota_is_wired_for_production_and_cpu_compose() -> None:
+    compose = (Path(__file__).parents[1] / "compose.yml").read_text()
+    cpu_override = (Path(__file__).parents[1] / "compose.test.yml").read_text()
+
+    setting = (
+        "IMAGE_API_PROCESSING_MAX_PERSISTED_OUTPUT_BYTES: "
+        "${IMAGE_API_PROCESSING_MAX_PERSISTED_OUTPUT_BYTES:-18000000000}"
+    )
+    assert compose.count(setting) == 4
+    assert "IMAGE_API_PROCESSING_MAX_PERSISTED_OUTPUT_BYTES" not in cpu_override
 
 
 def test_openapi_keeps_birefnet_inference_bounded_at_4096(tmp_path: Path) -> None:

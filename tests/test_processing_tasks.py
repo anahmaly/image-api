@@ -30,7 +30,13 @@ def setup(
     tmp_path: Path, **overrides: object
 ) -> tuple[TestClient, TaskStore, FakeWorkerClient, Settings]:
     settings = Settings.for_tests(tmp_path, **overrides)
-    store = TaskStore(settings.database_path, settings.max_queue_depth)
+    store = TaskStore(
+        settings.database_path,
+        settings.max_queue_depth,
+        processing_max_persisted_output_bytes=settings.processing_max_persisted_output_bytes,
+        processing_max_encoded_output_bytes=settings.processing_max_encoded_output_bytes,
+        output_dir=settings.output_dir,
+    )
     workers = FakeWorkerClient()
     client = TestClient(create_app(settings=settings, store=store, workers=workers))
     return client, store, workers, settings
@@ -181,6 +187,14 @@ def test_runner_publishes_exact_output_metadata_and_lost_response_replay_is_sing
     assert download.content == png("RGB", (16, 12))
     assert record.output_sha256 == hashlib.sha256(download.content).hexdigest()
     assert (record.output_width, record.output_height, record.output_mode) == (16, 12, "RGB")
+    assert record.output_size_bytes == len(download.content)
+    restarted = TaskStore(
+        settings.database_path,
+        processing_max_persisted_output_bytes=settings.processing_max_persisted_output_bytes,
+        processing_max_encoded_output_bytes=settings.processing_max_encoded_output_bytes,
+        output_dir=settings.output_dir,
+    )
+    assert restarted.processing_output_bytes_used() == len(download.content)
     assert status.json()["output"] == {
         "fileName": f"{task_id}.png",
         "sha256": record.output_sha256,
@@ -351,6 +365,7 @@ def test_status_and_result_behavior_for_all_states_and_corrupt_success(
         output_width=16,
         output_height=12,
         output_mode="RGB",
+        output_size_bytes=len(output),
     )
     path.write_bytes(b"corrupt")
     with caplog.at_level("ERROR"):
@@ -393,8 +408,16 @@ def test_restart_reconciles_persisted_success_or_fails_without_rerun(tmp_path: P
 
     assert recovered == 2
     assert store.get(succeeded).status == "succeeded"
+    assert store.get(succeeded).output_size_bytes == len(png("RGB", (16, 12)))
     assert store.get(interrupted).status == "failed"
     assert store.get(interrupted).error_code == "worker_interrupted"
+    restarted = TaskStore(
+        settings.database_path,
+        processing_max_persisted_output_bytes=settings.processing_max_persisted_output_bytes,
+        processing_max_encoded_output_bytes=settings.processing_max_encoded_output_bytes,
+        output_dir=settings.output_dir,
+    )
+    assert restarted.processing_output_bytes_used() == len(png("RGB", (16, 12)))
     assert runner.run_one() is False
     assert calls == 0
 
@@ -487,3 +510,25 @@ def test_processing_limits_are_route_scoped_and_sync_routes_remain_compatible(
     assert workers.last_upscale == {"model": "RealESRGAN_x4plus", "outscale": 2.0, "tile": 512}
     assert generation.status_code == 413
     assert settings.processing_max_request_bytes > settings.max_request_bytes
+
+
+def test_quota_rejection_removes_staged_source_without_admitting_task_or_inference(
+    tmp_path: Path,
+) -> None:
+    client, store, workers, settings = setup(
+        tmp_path,
+        processing_max_encoded_output_bytes=1_000,
+        processing_max_persisted_output_bytes=1_000,
+    )
+    first_source = png("RGB", (8, 6))
+    rejected_source = png("RGB", (9, 6))
+
+    first = admit_upscale(client, source=first_source, key="quota-first-key")
+    rejected = admit_upscale(client, source=rejected_source, key="quota-second-key")
+
+    assert first.status_code == 202
+    assert rejected.status_code == 507
+    assert rejected.json() == {"detail": "persisted processing output quota is full"}
+    assert store.count() == 1
+    assert workers.model_invocations == 0
+    assert {path.read_bytes() for path in settings.source_dir.glob("*.png")} == {first_source}
