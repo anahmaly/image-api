@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import threading
+import time
 from io import BytesIO
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -11,8 +15,14 @@ from helpers import png
 from image_api.app import create_app
 from image_api.config import Settings
 from image_api.lane import GpuLane
-from image_api.processing import ProcessingRunner, recover_processing_tasks
-from image_api.store import TaskStore
+from image_api.processing import (
+    ProcessingRunner,
+    processing_runner_running,
+    recover_processing_tasks,
+    run_processing_loop,
+    start_processing_runner,
+)
+from image_api.store import TaskKind, TaskRecord, TaskStore
 from image_api.workers import FakeWorkerClient
 
 
@@ -178,6 +188,137 @@ def test_runner_publishes_exact_output_metadata_and_lost_response_replay_is_sing
         "height": 12,
         "mode": "RGB",
     }
+
+
+def test_durable_runner_waits_for_busy_lane_without_failing_or_invoking_model(
+    tmp_path: Path,
+) -> None:
+    client, store, _, settings = setup(tmp_path)
+    task_id = admit_upscale(client, source=png("RGB", (8, 6))).json()["taskId"]
+    model_called = threading.Event()
+    calls = 0
+
+    def model(_source: Path, request: dict[str, object]) -> bytes:
+        nonlocal calls
+        calls += 1
+        model_called.set()
+        return png("RGB", (16, 12))
+
+    runner = ProcessingRunner(
+        "upscale",
+        store,
+        GpuLane(settings.gpu_lane_path, timeout_seconds=0.01),
+        settings.source_dir,
+        settings.output_dir,
+        model,
+        settings,
+    )
+    finished = threading.Event()
+
+    def run_once() -> None:
+        runner.run_one()
+        finished.set()
+
+    with GpuLane(settings.gpu_lane_path, timeout_seconds=0.01).acquire("generation"):
+        thread = threading.Thread(target=run_once)
+        thread.start()
+        for _ in range(100):
+            if store.get(task_id).status == "running":
+                break
+            finished.wait(0.01)
+        assert store.get(task_id).status == "running"
+        assert not finished.wait(0.05)
+        assert not model_called.is_set()
+
+    thread.join(2)
+    assert not thread.is_alive()
+    assert finished.is_set()
+    assert model_called.is_set()
+    assert calls == 1
+    assert store.get(task_id).status == "succeeded"
+    assert (settings.output_dir / f"{task_id}.png").read_bytes() == png("RGB", (16, 12))
+    assert GpuLane(settings.gpu_lane_path).status() == {
+        "activeCapability": None,
+        "active": False,
+    }
+    assert runner.run_one() is False
+    assert calls == 1
+
+
+class FailFirstClaimStore(TaskStore):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.claim_calls = 0
+
+    def claim_next(self, worker_id: str, task_kind: TaskKind = "generation") -> TaskRecord | None:
+        self.claim_calls += 1
+        if self.claim_calls == 1:
+            raise OSError("simulated transient claim failure")
+        return super().claim_next(worker_id, task_kind)
+
+
+def test_processing_service_loop_survives_control_failure_and_starts_only_once(
+    tmp_path: Path, caplog
+) -> None:
+    settings = Settings.for_tests(tmp_path)
+    store = FailFirstClaimStore(settings.database_path)
+    client = TestClient(create_app(settings=settings, store=store, workers=FakeWorkerClient()))
+    task_id = admit_upscale(client, source=png("RGB", (8, 6))).json()["taskId"]
+    calls = 0
+    processed = threading.Event()
+    stop = threading.Event()
+
+    def model(_source: Path, request: dict[str, object]) -> bytes:
+        nonlocal calls
+        calls += 1
+        processed.set()
+        return png("RGB", (16, 12))
+
+    runner = ProcessingRunner(
+        "upscale",
+        store,
+        GpuLane(settings.gpu_lane_path),
+        settings.source_dir,
+        settings.output_dir,
+        model,
+        settings,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        assert start_processing_runner(
+            "upscale", lambda: runner, poll_seconds=0.01, error_backoff_seconds=0.01, stop=stop
+        )
+        assert not start_processing_runner(
+            "upscale", lambda: runner, poll_seconds=0.01, error_backoff_seconds=0.01, stop=stop
+        )
+        assert processing_runner_running("upscale")
+        assert processed.wait(2)
+        stop.set()
+        for _ in range(100):
+            if not processing_runner_running("upscale"):
+                break
+            time.sleep(0.01)
+
+    assert not processing_runner_running("upscale")
+    assert store.get(task_id).status == "succeeded"
+    assert calls == 1
+    assert store.claim_calls >= 2
+    assert "capability=upscale" in caplog.text
+    assert "simulated transient claim failure" in caplog.text
+
+
+def test_run_processing_loop_does_not_catch_process_termination() -> None:
+    class TerminatingRunner:
+        def run_one(self) -> bool:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_processing_loop(
+            TerminatingRunner(),
+            "upscale",
+            poll_seconds=0,
+            error_backoff_seconds=0,
+        )
 
 
 def test_status_and_result_behavior_for_all_states_and_corrupt_success(

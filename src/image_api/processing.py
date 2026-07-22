@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 import uuid
 from pathlib import Path
-from typing import BinaryIO, Callable, Literal
+from typing import BinaryIO, Callable, Literal, Protocol
 
 from image_api.config import Settings
 from image_api.generation import (
@@ -24,6 +25,84 @@ ProcessingModel = Callable[[Path, dict[str, object]], bytes | BinaryIO]
 FailureInjector = Callable[[str], None]
 PeerEvictor = Callable[[], None]
 _CHUNK_BYTES = 64 * 1024
+_RUNNER_THREADS: dict[ProcessingCapability, threading.Thread] = {}
+_RUNNER_START_LOCK = threading.Lock()
+
+
+class ProcessingLoopRunner(Protocol):
+    def run_one(self) -> bool: ...
+
+
+def run_processing_loop(
+    runner: ProcessingLoopRunner,
+    capability: ProcessingCapability,
+    *,
+    poll_seconds: float,
+    error_backoff_seconds: float,
+    stop: threading.Event | None = None,
+) -> None:
+    """Run a durable processing control loop without dying on transient control errors."""
+    stop = stop or threading.Event()
+    while not stop.is_set():
+        try:
+            processed = runner.run_one()
+        except Exception as exc:
+            logger.error(
+                "processing runner control iteration failed: capability=%s error=%r",
+                capability,
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            stop.wait(error_backoff_seconds)
+            continue
+        if not processed:
+            stop.wait(poll_seconds)
+
+
+def processing_runner_running(capability: ProcessingCapability) -> bool:
+    with _RUNNER_START_LOCK:
+        thread = _RUNNER_THREADS.get(capability)
+        return thread is not None and thread.is_alive()
+
+
+def start_processing_runner(
+    capability: ProcessingCapability,
+    runner_factory: Callable[[], ProcessingLoopRunner],
+    *,
+    poll_seconds: float,
+    error_backoff_seconds: float,
+    stop: threading.Event | None = None,
+) -> bool:
+    """Start at most one durable runner for a capability in this process."""
+    with _RUNNER_START_LOCK:
+        current = _RUNNER_THREADS.get(capability)
+        if current is not None and current.is_alive():
+            return False
+        runner = runner_factory()
+        thread: threading.Thread
+
+        def loop() -> None:
+            try:
+                run_processing_loop(
+                    runner,
+                    capability,
+                    poll_seconds=poll_seconds,
+                    error_backoff_seconds=error_backoff_seconds,
+                    stop=stop,
+                )
+            finally:
+                with _RUNNER_START_LOCK:
+                    if _RUNNER_THREADS.get(capability) is thread:
+                        del _RUNNER_THREADS[capability]
+
+        thread = threading.Thread(target=loop, name=f"{capability}-task-runner", daemon=True)
+        _RUNNER_THREADS[capability] = thread
+        try:
+            thread.start()
+        except Exception:
+            del _RUNNER_THREADS[capability]
+            raise
+        return True
 
 
 def _processing_contract(task: TaskRecord) -> tuple[tuple[int, int], str]:
@@ -228,7 +307,7 @@ class ProcessingRunner:
             return False
         try:
             source = _validate_source(task, self.source_dir, self.settings)
-            with self.lane.acquire(self.capability):
+            with self.lane.acquire_wait(self.capability):
                 if self.peer_evictor is not None:
                     self.peer_evictor()
                 encoded = self.model(source, task.request)

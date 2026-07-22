@@ -8,7 +8,6 @@ import logging
 import math
 import os
 import threading
-import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -21,7 +20,11 @@ from PIL import Image
 from image_api.images import validate_dimensions
 from image_api.config import Settings
 from image_api.lane import GpuLane
-from image_api.processing import ProcessingRunner, recover_processing_tasks
+from image_api.processing import (
+    ProcessingRunner,
+    recover_processing_tasks,
+    start_processing_runner,
+)
 from image_api.store import TaskStore
 from image_api.workers import PeerEvictor
 from image_api_workers.execution import execute_in_gpu_lane
@@ -128,64 +131,64 @@ def _shutdown_unload() -> None:
 atexit.register(_shutdown_unload)
 
 
-def start_durable_runner() -> None:
+def start_durable_runner() -> bool:
     if os.getenv("IMAGE_API_ENABLE_PROCESSING_RUNNER", "false").lower() != "true":
-        return
-    settings = Settings.from_env()
-    store = TaskStore(settings.database_path, settings.max_queue_depth)
-    recovered = recover_processing_tasks(
-        "upscale", store, settings.output_dir, settings.source_dir, settings
+        return False
+
+    def build_runner() -> ProcessingRunner:
+        settings = Settings.from_env()
+        store = TaskStore(settings.database_path, settings.max_queue_depth)
+        recovered = recover_processing_tasks(
+            "upscale", store, settings.output_dir, settings.source_dir, settings
+        )
+        if recovered:
+            logger.warning("reconciled interrupted upscale tasks: count=%s", recovered)
+
+        def model(source: Path, request: dict[str, object]) -> bytes:
+            with source.open("rb") as handle:
+                data = handle.read(settings.processing_max_upload_bytes + 1)
+            if len(data) > settings.processing_max_upload_bytes:
+                raise ValueError("persisted source exceeds configured limit")
+            model_name = request.get("model")
+            outscale = request.get("outscale")
+            tile = request.get("tile")
+            if (
+                not isinstance(model_name, str)
+                or model_name not in MODELS
+                or not isinstance(outscale, (int, float))
+                or isinstance(outscale, bool)
+                or type(tile) is not int
+            ):
+                raise ValueError("invalid persisted upscale parameters")
+            with _model_lock:
+                return _run_upscale(
+                    data,
+                    model=model_name,
+                    outscale=float(outscale),
+                    tile=tile,
+                )
+
+        return ProcessingRunner(
+            "upscale",
+            store,
+            GpuLane(settings.gpu_lane_path, settings.lane_timeout_seconds),
+            settings.source_dir,
+            settings.output_dir,
+            model,
+            settings,
+            peer_evictor=PeerEvictor(
+                (
+                    os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
+                    os.getenv("IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"),
+                )
+            ),
+        )
+
+    poll = float(os.getenv("IMAGE_API_PROCESSING_POLL_SECONDS", "0.5"))
+    backoff = float(os.getenv("IMAGE_API_PROCESSING_ERROR_BACKOFF_SECONDS", "1.0"))
+    return start_processing_runner(
+        "upscale", build_runner, poll_seconds=poll, error_backoff_seconds=backoff
     )
-    if recovered:
-        logger.warning("reconciled interrupted upscale tasks: count=%s", recovered)
-
-    def model(source: Path, request: dict[str, object]) -> bytes:
-        with source.open("rb") as handle:
-            data = handle.read(settings.processing_max_upload_bytes + 1)
-        if len(data) > settings.processing_max_upload_bytes:
-            raise ValueError("persisted source exceeds configured limit")
-        model_name = request.get("model")
-        outscale = request.get("outscale")
-        tile = request.get("tile")
-        if (
-            not isinstance(model_name, str)
-            or model_name not in MODELS
-            or not isinstance(outscale, (int, float))
-            or isinstance(outscale, bool)
-            or type(tile) is not int
-        ):
-            raise ValueError("invalid persisted upscale parameters")
-        with _model_lock:
-            return _run_upscale(
-                data,
-                model=model_name,
-                outscale=float(outscale),
-                tile=tile,
-            )
-
-    runner = ProcessingRunner(
-        "upscale",
-        store,
-        GpuLane(settings.gpu_lane_path, settings.lane_timeout_seconds),
-        settings.source_dir,
-        settings.output_dir,
-        model,
-        settings,
-        peer_evictor=PeerEvictor(
-            (
-                os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
-                os.getenv("IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"),
-            )
-        ),
-    )
-
-    def loop() -> None:
-        poll = float(os.getenv("IMAGE_API_PROCESSING_POLL_SECONDS", "0.5"))
-        while True:
-            if not runner.run_one():
-                time.sleep(poll)
-
-    threading.Thread(target=loop, name="upscale-task-runner", daemon=True).start()
 
 
 @asynccontextmanager
