@@ -177,20 +177,30 @@ async def _validated_sync_upload(file: UploadFile, settings: Settings) -> ImageI
         raise
 
 
+def _worker_image_chunks(stream: Any) -> Any:
+    try:
+        while chunk := stream.read(UPLOAD_CHUNK_BYTES):
+            yield chunk
+    finally:
+        stream.close()
+
+
 def _worker_image_response(encoded: object) -> Response:
     if isinstance(encoded, bytes):
         return Response(encoded, media_type="image/png")
     if not all(hasattr(encoded, member) for member in ("read", "seek", "close")):
         raise InvalidWorkerImage("worker output type mismatch")
     stream = cast(Any, encoded)
-    stream.seek(0)
-
-    def chunks() -> Any:
-        while chunk := stream.read(UPLOAD_CHUNK_BYTES):
-            yield chunk
+    try:
+        stream.seek(0)
+    except BaseException:
+        stream.close()
+        raise
 
     return StreamingResponse(
-        chunks(), media_type="image/png", background=BackgroundTask(stream.close)
+        _worker_image_chunks(stream),
+        media_type="image/png",
+        background=BackgroundTask(stream.close),
     )
 
 

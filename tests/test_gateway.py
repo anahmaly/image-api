@@ -5,9 +5,8 @@ from io import BytesIO
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
-
 from helpers import png
-from image_api.app import create_app
+from image_api.app import _worker_image_chunks, _worker_image_response, create_app
 from image_api.config import Settings
 from image_api.store import TaskStore
 from image_api.workers import FakeWorkerClient
@@ -178,3 +177,42 @@ def test_unknown_routes_and_malformed_lengths_use_safe_default_limit(
     assert unknown.status_code == 413
     assert malformed.status_code == 400
     assert worker.model_invocations == 0
+
+
+def test_worker_stream_closes_when_streaming_is_cancelled() -> None:
+    class TrackingStream(BytesIO):
+        closed_by_response = False
+
+        def close(self) -> None:
+            self.closed_by_response = True
+            super().close()
+
+    stream = TrackingStream(b"first-second")
+    iterator = _worker_image_chunks(stream)
+    chunk = next(iterator)
+
+    assert chunk == b"first-second"
+    assert stream.closed_by_response is False
+
+    iterator.close()
+
+    assert stream.closed_by_response is True
+
+
+def test_worker_stream_closes_when_initial_seek_fails() -> None:
+    class SeekFailureStream(BytesIO):
+        closed_by_response = False
+
+        def seek(self, *_args, **_kwargs):
+            raise OSError("seek failed")
+
+        def close(self) -> None:
+            self.closed_by_response = True
+            super().close()
+
+    stream = SeekFailureStream(b"payload")
+
+    with pytest.raises(OSError, match="seek failed"):
+        _worker_image_response(stream)
+
+    assert stream.closed_by_response is True
