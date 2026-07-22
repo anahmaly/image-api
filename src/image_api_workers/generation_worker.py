@@ -88,7 +88,13 @@ def main() -> None:
     settings = Settings.from_env()
     state = settings.state_dir
     start_worker_heartbeat(settings.generation_heartbeat_path)
-    store = TaskStore(settings.database_path, settings.max_queue_depth)
+    store = TaskStore(
+        settings.database_path,
+        settings.max_queue_depth,
+        processing_max_persisted_output_bytes=settings.processing_max_persisted_output_bytes,
+        processing_max_encoded_output_bytes=settings.processing_max_encoded_output_bytes,
+        output_dir=settings.output_dir,
+    )
     recovered = recover_interrupted_tasks(store, settings.output_dir, settings.source_dir)
     if recovered:
         logger.warning("Reconciled interrupted generation tasks: count=%s", recovered)

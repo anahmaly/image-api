@@ -8,7 +8,7 @@ Only the `image-api` gateway publishes port `8000`. Worker control routes are Co
 
 Before a selected worker loads or runs a model, it asks every peer worker to unload resident models while it still owns the global lane. Peer eviction fails closed: an unreachable peer prevents the new model from loading. The generation worker also unloads on switches among `ideogram-4-nf4`, `longcat-image-edit`, and `longcat-image-edit-turbo`. Same-worker/same-model requests may reuse the resident pipeline. Disposal removes Diffusers/Accelerate hooks, clears model references, runs garbage collection, and conditionally clears the CUDA allocator.
 
-Generation and edit admissions use synchronous SQLite durability. Image-edit source bytes are validated, normalized to a deterministic RGB PNG, fsynced, and atomically published under `/state/sources` before `202` is returned. The durable idempotency fingerprint includes the exact uploaded-byte SHA-256 and every semantic parameter. Results are validated RGB PNGs, fsynced, atomically renamed, and then marked successful. Restart reconciliation never re-invokes an interrupted task.
+Generation, edit, upscale-task, and background-removal-task admissions use synchronous SQLite durability. Every shared-state writer runs as numeric UID/GID `10001:10001`. The root-only `state-init` one-shot preflights and then performs a no-symlink, same-volume ownership migration capped by `IMAGE_API_STATE_INIT_MAX_ENTRIES` and `IMAGE_API_STATE_INIT_MAX_DEPTH`; all writers wait for it to finish. The startup volume must remain quiescent throughout init so the preflight tree is the tree that is migrated. Each process then opens SQLite with WAL and `synchronous=FULL`; schema creation, inspection, every additive legacy-column migration, and index creation run inside one `BEGIN IMMEDIATE` transaction. The cross-process write lock makes concurrent worker initialization observe either the complete legacy schema or the complete migrated schema while preserving legacy rows and the `generation` task-kind default. Gateway readiness then proves that the source lock/file path and SQLite are writable without loading or invoking a model. Image-edit source bytes are validated, normalized to a deterministic RGB PNG, fsynced, and atomically published under `/state/sources` before `202` is returned. The durable idempotency fingerprint includes the exact uploaded-byte SHA-256 and every semantic parameter. Results are validated RGB PNGs, fsynced, atomically renamed, and then marked successful. Restart reconciliation never re-invokes an interrupted task.
 
 ## Public API
 
@@ -16,6 +16,8 @@ Generation and edit admissions use synchronous SQLite durability. Image-edit sou
 - `GET /v1/models` — supported models and honest generation/editing contracts.
 - `POST /v1/upscale` — synchronous multipart upscale.
 - `POST /v1/background-removal` — synchronous multipart background removal.
+- `POST /v1/upscale-tasks` plus `GET /v1/upscale-tasks/{taskId}` and `/image` — durable asynchronous upscale.
+- `POST /v1/background-removal-tasks` plus matching `GET` status and `/image` routes — durable asynchronous background removal.
 - `POST /v1/generations` — durable asynchronous Ideogram generation.
 - `GET /v1/generations/{taskId}` and `/image` — generation status/result.
 - `POST /v1/image-edits` — durable asynchronous LongCat single-image edit.
@@ -24,25 +26,108 @@ Generation and edit admissions use synchronous SQLite durability. Image-edit sou
 
 OpenAPI is available at `/openapi.json` and `/docs`.
 
-### Upscale
+### Upscale and staged square clip-art processing
 
-Model IDs are `RealESRGAN_x4plus` and `RealESRGAN_x4plus_anime_6B`. `outscale` is `1–4`; `tile` is `0` or a multiple of 32 through 1024.
+Model IDs remain `RealESRGAN_x4plus` and `RealESRGAN_x4plus_anime_6B`. `outscale` remains `1–4`; `tile` remains `0` or a multiple of 32 through 1024. Real-ESRGAN always receives RGB: alpha is discarded rather than upscaled. Inputs larger than 1024 on either edge are forced to the worker's 512-pixel tile when the compatibility value `tile=0` is supplied.
+
+The supported 8K-square clip-art order is explicit and is not collapsed into one request:
+
+1. Upload a `1024x1024` RGB image with `outscale=4`; require the response to be exactly `4096x4096` RGB.
+2. Upload that `4096x4096` RGB response with `outscale=2`; require the response to be exactly `8192x8192` RGB (`67,108,864` pixels).
+3. Upload the `8192x8192` RGB response once to BiRefNet background removal; require exactly `8192x8192` RGBA PNG.
 
 ```sh
 curl -f -X POST \
+  'http://HOST:8000/v1/upscale?model=RealESRGAN_x4plus&outscale=4&tile=512' \
+  -F 'file=@clipart-1024-rgb.png' -o clipart-4096-rgb.png
+curl -f -X POST \
   'http://HOST:8000/v1/upscale?model=RealESRGAN_x4plus&outscale=2&tile=512' \
-  -F 'file=@input.png' -o output.png
+  -F 'file=@clipart-4096-rgb.png' -o clipart-8192-rgb.png
 ```
+
+The gateway and worker reject a dimension or mode mismatch; they never silently substitute a 4K result for a failed 8K request. "4K" here means square `4096x4096`, and "8K" means square `8192x8192`, not UHD landscape.
+
+### Durable upscale and background-removal tasks
+
+The task routes are the crash-safe consumer contract; the synchronous routes above remain unchanged for backward compatibility. Admission validates and fsyncs the source plus SQLite request before returning `202`. It does not probe readiness, load a model, enter the GPU lane, or invoke inference.
+
+Upscale admission is multipart `file` plus required `Idempotency-Key` and the same query contract as synchronous upscale:
+
+```sh
+curl -f -X POST \
+  -H 'Idempotency-Key: listing-123-upscale-4k-v1' \
+  'http://HOST:8000/v1/upscale-tasks?model=RealESRGAN_x4plus&outscale=4&tile=512' \
+  -F 'file=@clipart-1024-rgb.png'
+```
+
+Background-removal admission is multipart `file` plus required `Idempotency-Key`. Its query fields are `model`, `alpha_blur` (`0–20`, default `0`), `alpha_erode`/`alpha_dilate` (`0–100`, default `0`), `alpha_threshold` (`0–255`, default `0`), `birefnet_inference_size` (`512–4096`, default `2048`), `birefnet_foreground_refinement` (default `false`), `model_input_size` (`512–2048`, default `1024`), `despill_enabled` (default `false`), `despill_color` (`black|white|green|blue|custom`, default `black`), and six-digit `despill_hex_color` (default `000000`).
+
+```sh
+curl -f -X POST \
+  -H 'Idempotency-Key: listing-123-background-v1' \
+  'http://HOST:8000/v1/background-removal-tasks?model=birefnet-hr-matting&birefnet_inference_size=4096&birefnet_foreground_refinement=true&alpha_blur=0&alpha_erode=0&alpha_dilate=0&alpha_threshold=0&despill_enabled=false&despill_color=black&despill_hex_color=000000' \
+  -F 'file=@clipart-8192-rgb.png'
+```
+
+Every accepted or exact-replay admission returns `202` with this status shape (values shown are an upscale example):
+
+```json
+{
+  "taskId": "32-lowercase-hex-characters",
+  "status": "queued",
+  "capability": "upscale",
+  "model": "RealESRGAN_x4plus",
+  "sourceSha256": "64-lowercase-hex-characters",
+  "requestedWidth": 1024,
+  "requestedHeight": 1024,
+  "expectedWidth": 4096,
+  "expectedHeight": 4096,
+  "expectedMode": "RGB"
+}
+```
+
+`status` is `queued`, `running`, `succeeded`, or `failed`. A failed response adds `error: {"code": "bounded_code", "message": "Image processing did not complete"}`. A succeeded response adds immutable output metadata:
+
+```json
+{
+  "output": {
+    "fileName": "TASK_ID.png",
+    "sha256": "64-lowercase-hex-characters",
+    "width": 4096,
+    "height": 4096,
+    "mode": "RGB"
+  }
+}
+```
+
+Poll and download through the matching capability route. Download returns `409` until the task succeeds and `503` if a succeeded task's persisted result is missing, corrupt, or inconsistent; it never invokes inference or changes task state.
+
+```sh
+curl -f http://HOST:8000/v1/upscale-tasks/TASK_ID
+curl -f http://HOST:8000/v1/upscale-tasks/TASK_ID/image -o upscaled.png
+curl -f http://HOST:8000/v1/background-removal-tasks/TASK_ID
+curl -f http://HOST:8000/v1/background-removal-tasks/TASK_ID/image -o transparent.png
+```
+
+Idempotency binds the capability, exact model, exact uploaded-byte SHA-256/source identity, requested dimensions, expected dimensions/mode, and every semantic query field listed above. Replaying the same key and exact source/parameters returns the original task in its current state. Reusing the key with any different source byte or field returns `409`.
+
+Each processing worker claims only its exact capability. All durable task kinds share the explicit `IMAGE_API_MAX_QUEUE_DEPTH` active-task bound and the existing singleton GPU lane/peer-unload policy. On restart, queued tasks remain queued. A running task with a fully fsynced, valid task-bound output reconciles to `succeeded` without inference; a running task without one becomes terminal `failed` with `worker_interrupted` and is never silently requeued or retried. Terminal source cleanup is content-addressed, source-reference-aware, and coordinated by the shared source lock.
+
+Processing admission also reserves its persisted-output ceiling atomically in the same SQLite write transaction. Queued and running processing tasks count their full per-task reservation; succeeded processing tasks count the exact persisted canonical-file size. Generation and image-edit tasks are excluded. Legacy or inconsistent succeeded processing metadata is accounted from the canonical regular file when available and otherwise from the conservative reservation ceiling. Exact idempotent replay returns the already-admitted task without reserving again even when the quota is full; conflicting reuse still returns `409`. A new processing admission that would exceed the quota returns `507` before inference and removes only a newly staged unreferenced source. Failed/interrupted tasks without a valid final output release their reservation when they become terminal.
+
+The quota deliberately never deletes immutable results, applies TTL/LRU, or reruns work. When it fills, operators must preserve existing results and either provision more state capacity and explicitly raise the quota or stop admitting new processing tasks.
 
 ### Background removal
 
-Model IDs are `bria-rmbg-2.0` and `birefnet-hr-matting`.
+Model IDs remain `bria-rmbg-2.0` and `birefnet-hr-matting`. For the staged clip-art path, use BiRefNet once after both RGB upscales:
 
 ```sh
 curl -f -X POST \
-  'http://HOST:8000/v1/background-removal?model=birefnet-hr-matting&birefnet_inference_size=2048' \
-  -F 'file=@input.png' -o foreground.png
+  'http://HOST:8000/v1/background-removal?model=birefnet-hr-matting&birefnet_inference_size=4096' \
+  -F 'file=@clipart-8192-rgb.png' -o clipart-8192-rgba.png
 ```
+
+The output canvas remains `8192x8192`, but `birefnet_inference_size` is independently bounded to `512–4096` and defaults to `2048`. BiRefNet therefore performs model inference at no more than its documented 4096 internal size and post-processes back to the original canvas. This is not native 8K matting.
 
 ### Ideogram 4 generation (compatibility retained)
 
@@ -166,14 +251,41 @@ docker compose -f compose.yml -f compose.test.yml up --build
 
 ## Configuration bounds
 
-- `IMAGE_API_MAX_REQUEST_BYTES` default `21000000` for the entire request body.
-- `IMAGE_API_MAX_UPLOAD_BYTES` default `20000000` with chunked upload reads.
-- `IMAGE_API_MAX_INPUT_PIXELS` default `40000000`.
-- `IMAGE_API_MAX_OUTPUT_PIXELS` default `80000000`.
-- `IMAGE_API_MAX_QUEUE_DEPTH` default `100`.
-- `IMAGE_API_WORKER_TIMEOUT_SECONDS` and `IMAGE_API_LANE_TIMEOUT_SECONDS` are positive bounded waits.
+The established generation/image-edit admission limits remain unchanged:
 
-Accepted edit source formats are PNG, JPEG, and WebP in common grayscale/palette/RGB/RGBA modes. They are normalized to RGB PNG only after exact uploaded-byte hashing.
+- `IMAGE_API_MAX_REQUEST_BYTES=21000000` caps non-processing request bodies, including `/v1/image-edits`.
+- `IMAGE_API_MAX_UPLOAD_BYTES=20000000`, `IMAGE_API_MAX_INPUT_WIDTH=10000`, `IMAGE_API_MAX_INPUT_HEIGHT=10000`, and `IMAGE_API_MAX_INPUT_PIXELS=40000000` retain the existing edit upload and decoded-image contract.
+- `IMAGE_API_MAX_OUTPUT_PIXELS=80000000`, `IMAGE_API_MAX_DECODED_INPUT_BYTES=160000000`, and `IMAGE_API_MAX_DECODED_OUTPUT_BYTES=320000000` keep non-processing decoded memory bounded.
+
+The synchronous and durable-task `/v1/upscale` and `/v1/background-removal` route families use separate 8K processing limits:
+
+- `IMAGE_API_PROCESSING_MAX_REQUEST_BYTES=285000000` caps the complete processing multipart request.
+- `IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES=280000000` caps the encoded processing upload at both gateway and worker.
+- `IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES=300000000` independently caps processing-worker HTTP output and BiRefNet PNG post-processing; this per-artifact support is unchanged.
+- `IMAGE_API_PROCESSING_MAX_PERSISTED_OUTPUT_BYTES=18000000000` caps durable processing outputs plus active reservations. The 18,000,000,000-byte default is exactly `20 × 3 × 300,000,000`, so one complete 20-image V3 run can retain up to three worst-case processing-stage outputs per image. Production and the CPU-only Compose override inherit the same finite default.
+- `IMAGE_API_PROCESSING_MAX_INPUT_WIDTH=8192`, `IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT=8192`, `IMAGE_API_PROCESSING_MAX_INPUT_PIXELS=67108864`, and `IMAGE_API_PROCESSING_MAX_OUTPUT_PIXELS=67108864` define the square-8K canvas contract.
+- `IMAGE_API_PROCESSING_MAX_DECODED_INPUT_BYTES=268435456` and `IMAGE_API_PROCESSING_MAX_DECODED_OUTPUT_BYTES=268435456` conservatively budget four decoded bytes per processing pixel.
+- `IMAGE_API_PROCESSING_MAX_NATIVE_WIDTH=16384`, `IMAGE_API_PROCESSING_MAX_NATIVE_HEIGHT=16384`, and `IMAGE_API_PROCESSING_MAX_NATIVE_PIXELS=268435456` separately bound Real-ESRGAN's native intermediate canvas.
+- `IMAGE_API_PROCESSING_MAX_NATIVE_BYTES=3221225472` bounds that native RGB intermediate at three float32 channels per pixel; it is an admission budget, not a promise about total allocator usage.
+- `IMAGE_API_WORKER_TIMEOUT_SECONDS=900` is the gateway-to-worker processing timeout. Increase it explicitly if a measured 8K run needs longer; timeout never changes requested dimensions.
+- `IMAGE_API_LANE_TIMEOUT_SECONDS` bounds waiting to enter the singleton GPU lane; it does not interrupt work that already owns the lane.
+- `IMAGE_API_MAX_QUEUE_DEPTH=100` bounds queued plus running durable tasks across generation, image editing, upscale, and background removal.
+- `IMAGE_API_STATE_INIT_MAX_ENTRIES=100000` bounds the existing-volume ownership migration and fails startup before ownership or mode changes when preflight exceeds it.
+- `IMAGE_API_STATE_INIT_MAX_DEPTH=32` bounds nested directories (the state root is depth zero), limiting live traversal descriptors independently of entry count. The state layout is normally only a few levels deep (`tasks.sqlite3`, locks, and source files), so 32 leaves substantial legacy-layout headroom without relying on the host's open-file ceiling. Init preflights both bounds before migration; keep the startup volume quiescent until `state-init` completes.
+
+An explicit slower-host example is:
+
+```sh
+IMAGE_API_WORKER_TIMEOUT_SECONDS=1800 \
+IMAGE_API_LANE_TIMEOUT_SECONDS=300 \
+docker compose up -d
+```
+
+These are independent controls rather than an encoded-size proxy for decoded memory. Gateway uploads remain in Starlette's spooled upload file, processing-worker uploads and gateway worker responses spool to disk after 8 MiB, and gateway responses stream from that bounded spool. The pinned Real-ESRGAN x4 helper applies `outscale=2` only after producing its native x4 result: the 4096-to-8192 stage therefore assembles a `16384x16384` intermediate before Lanczos downsampling. Its RGB float32 representation alone is 3 GiB, in addition to half/float tensors, the encoded input, the final 8192 image, model state, and allocator overhead. The pinned `rembg-api` adapter likewise requires in-process image/Pillow buffers and encoded `bytes`; an 8192 RGB canvas is about 192 MiB and an RGBA canvas is 256 MiB before overhead. Operators must budget host RAM, temporary-disk space, and VRAM for these unavoidable peaks.
+
+Square 4K remains the established dependable path. The deterministic suite proves contracts, boundaries, wiring, and exact dimensions with lightweight fixtures, but it does not prove real square-8K quality, VRAM headroom, or latency. A live RTX 4090 acceptance run is still required before calling the 8K path operationally validated.
+
+Accepted edit source formats remain PNG, JPEG, and WebP in common grayscale/palette/RGB/RGBA modes. They are normalized to RGB PNG only after exact uploaded-byte hashing.
 
 ## Development
 

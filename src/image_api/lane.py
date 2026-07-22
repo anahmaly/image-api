@@ -24,18 +24,35 @@ class GpuLane:
 
     @contextmanager
     def acquire(self, capability: str) -> Iterator[None]:
+        """Acquire the lane within the configured bounded admission timeout."""
+        with self._acquire(capability, timeout_seconds=self.timeout_seconds):
+            yield
+
+    @contextmanager
+    def acquire_wait(self, capability: str) -> Iterator[None]:
+        """Wait until the lane is available for already-admitted durable work."""
+        with self._acquire(capability, timeout_seconds=None):
+            yield
+
+    @contextmanager
+    def _acquire(self, capability: str, *, timeout_seconds: float | None) -> Iterator[None]:
         handle = self.path.open("a+b")
-        deadline = time.monotonic() + self.timeout_seconds
-        while True:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError as exc:
-                if time.monotonic() >= deadline:
-                    handle.close()
-                    raise LaneBusy("GPU lane is busy") from exc
-                time.sleep(0.01)
+        acquired = False
         try:
+            if timeout_seconds is None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                acquired = True
+            else:
+                deadline = time.monotonic() + timeout_seconds
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except BlockingIOError as exc:
+                        if time.monotonic() >= deadline:
+                            raise LaneBusy("GPU lane is busy") from exc
+                        time.sleep(0.01)
             temporary = self.status_path.with_suffix(
                 self.status_path.suffix + f".{os.getpid()}.tmp"
             )
@@ -44,10 +61,16 @@ class GpuLane:
             yield
         finally:
             try:
-                self.status_path.write_text(json.dumps({"activeCapability": None, "active": False}))
+                if acquired:
+                    self.status_path.write_text(
+                        json.dumps({"activeCapability": None, "active": False})
+                    )
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                handle.close()
+                try:
+                    if acquired:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
 
     def status(self) -> dict[str, object]:
         handle = self.path.open("a+b")

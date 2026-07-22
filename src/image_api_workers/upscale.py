@@ -5,18 +5,30 @@ import atexit
 import gc
 import io
 import logging
+import math
 import os
 import threading
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, AsyncIterator, Literal
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 
+from image_api.images import validate_dimensions
+from image_api.config import Settings
+from image_api.lane import GpuLane
+from image_api.processing import (
+    ProcessingRunner,
+    recover_processing_tasks,
+    start_processing_runner,
+)
+from image_api.store import TaskStore
 from image_api.workers import PeerEvictor
 from image_api_workers.execution import execute_in_gpu_lane
+from image_api_workers.uploads import read_bounded_upload
 
 logger = logging.getLogger(__name__)
 MODELS = {
@@ -109,9 +121,6 @@ def _release_model_for_transition(requested_model: str) -> None:
     _release_resident_model()
 
 
-app = FastAPI(title="image-api-upscale-worker", docs_url=None, redoc_url=None)
-
-
 def _shutdown_unload() -> None:
     try:
         _release_resident_model()
@@ -120,6 +129,81 @@ def _shutdown_unload() -> None:
 
 
 atexit.register(_shutdown_unload)
+
+
+def start_durable_runner() -> bool:
+    if os.getenv("IMAGE_API_ENABLE_PROCESSING_RUNNER", "false").lower() != "true":
+        return False
+
+    def build_runner() -> ProcessingRunner:
+        settings = Settings.from_env()
+        store = TaskStore(
+            settings.database_path,
+            settings.max_queue_depth,
+            processing_max_persisted_output_bytes=settings.processing_max_persisted_output_bytes,
+            processing_max_encoded_output_bytes=settings.processing_max_encoded_output_bytes,
+            output_dir=settings.output_dir,
+        )
+        recovered = recover_processing_tasks(
+            "upscale", store, settings.output_dir, settings.source_dir, settings
+        )
+        if recovered:
+            logger.warning("reconciled interrupted upscale tasks: count=%s", recovered)
+
+        def model(source: Path, request: dict[str, object]) -> bytes:
+            with source.open("rb") as handle:
+                data = handle.read(settings.processing_max_upload_bytes + 1)
+            if len(data) > settings.processing_max_upload_bytes:
+                raise ValueError("persisted source exceeds configured limit")
+            model_name = request.get("model")
+            outscale = request.get("outscale")
+            tile = request.get("tile")
+            if (
+                not isinstance(model_name, str)
+                or model_name not in MODELS
+                or not isinstance(outscale, (int, float))
+                or isinstance(outscale, bool)
+                or type(tile) is not int
+            ):
+                raise ValueError("invalid persisted upscale parameters")
+            with _model_lock:
+                return _run_upscale(
+                    data,
+                    model=model_name,
+                    outscale=float(outscale),
+                    tile=tile,
+                )
+
+        return ProcessingRunner(
+            "upscale",
+            store,
+            GpuLane(settings.gpu_lane_path, settings.lane_timeout_seconds),
+            settings.source_dir,
+            settings.output_dir,
+            model,
+            settings,
+            peer_evictor=PeerEvictor(
+                (
+                    os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
+                    os.getenv("IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"),
+                )
+            ),
+        )
+
+    poll = float(os.getenv("IMAGE_API_PROCESSING_POLL_SECONDS", "0.5"))
+    backoff = float(os.getenv("IMAGE_API_PROCESSING_ERROR_BACKOFF_SECONDS", "1.0"))
+    return start_processing_runner(
+        "upscale", build_runner, poll_seconds=poll, error_backoff_seconds=backoff
+    )
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    start_durable_runner()
+    yield
+
+
+app = FastAPI(title="image-api-upscale-worker", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 
 @app.get("/health")
@@ -137,21 +221,64 @@ def unload() -> dict[str, object]:
     return {"unloaded": True, "loaded": False}
 
 
+def _validate_worker_dimensions(width: int, height: int, *, output: bool) -> None:
+    suffix = "OUTPUT" if output else "INPUT"
+    validate_dimensions(
+        width,
+        height,
+        max_width=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_WIDTH", "8192")),
+        max_height=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT", "8192")),
+        max_pixels=int(os.getenv(f"IMAGE_API_PROCESSING_MAX_{suffix}_PIXELS", "67108864")),
+        max_decoded_bytes=int(
+            os.getenv(f"IMAGE_API_PROCESSING_MAX_DECODED_{suffix}_BYTES", "268435456")
+        ),
+    )
+
+
+def _validate_native_processing(width: int, height: int) -> None:
+    native_width = width * 4
+    native_height = height * 4
+    native_pixels = native_width * native_height
+    if (
+        native_width > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_WIDTH", "16384"))
+        or native_height > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_HEIGHT", "16384"))
+        or native_pixels > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_PIXELS", "268435456"))
+        or native_pixels * 3 * 4
+        > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_BYTES", "3221225472"))
+    ):
+        raise ValueError("Real-ESRGAN native processing exceeds configured limit")
+
+
+def _load_rgb_source(data: bytes) -> tuple[Image.Image, tuple[int, int]]:
+    with Image.open(io.BytesIO(data)) as image:
+        _validate_worker_dimensions(image.width, image.height, output=False)
+        _validate_native_processing(image.width, image.height)
+        image.load()
+        return image.convert("RGB"), image.size
+
+
+def _effective_tile(tile: int, width: int, height: int) -> int:
+    if tile < 0 or tile > 1024 or (tile and tile % 32):
+        raise ValueError("invalid tile")
+    return 512 if tile == 0 and max(width, height) > 1024 else tile
+
+
 def _run_upscale(data: bytes, *, model: str, outscale: float, tile: int) -> bytes:
     import numpy as np
     import torch
 
-    with Image.open(io.BytesIO(data)) as image:
-        image.load()
-        source = np.asarray(image.convert("RGBA" if image.mode == "RGBA" else "RGB"))
-    if source.shape[-1] == 3:
-        source = source[:, :, ::-1]
-    else:
-        source = source[:, :, [2, 1, 0, 3]]
+    if model not in MODELS:
+        raise ValueError("unsupported upscale model")
+    if not math.isfinite(outscale) or not 1 <= outscale <= 4:
+        raise ValueError("invalid outscale")
+    rgb_image, source_size = _load_rgb_source(data)
+    expected_size = (round(source_size[0] * outscale), round(source_size[1] * outscale))
+    _validate_worker_dimensions(*expected_size, output=True)
+    source = np.asarray(rgb_image)[:, :, ::-1]
     _release_model_for_transition(model)
     backend = _load_model(model)
     previous = backend.tile_size
-    backend.tile_size = tile
+    backend.tile_size = _effective_tile(tile, source_size[0], source_size[1])
     try:
         with torch.inference_mode():
             result, _ = backend.enhance(source, outscale=outscale)
@@ -159,6 +286,10 @@ def _run_upscale(data: bytes, *, model: str, outscale: float, tile: int) -> byte
         backend.tile_size = previous
     import cv2
 
+    if result.ndim != 3 or result.shape[2] != 3:
+        raise RuntimeError("upscale backend returned non-RGB output")
+    if (result.shape[1], result.shape[0]) != expected_size:
+        raise RuntimeError("upscale backend returned unexpected dimensions")
     ok, encoded = cv2.imencode(".png", result)
     if not ok:
         raise RuntimeError("PNG encoding failed")
@@ -174,8 +305,8 @@ async def upscale(
 ) -> Response:
     if tile and tile % 32:
         raise HTTPException(422, "invalid tile")
-    data = await file.read()
-    await file.close()
+    max_upload_bytes = int(os.getenv("IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES", "280000000"))
+    data = await read_bounded_upload(file, max_upload_bytes)
     try:
 
         def operation() -> bytes:
@@ -193,6 +324,11 @@ async def upscale(
             "upscale",
             operation,
         )
+        max_output_bytes = int(
+            os.getenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "300000000")
+        )
+        if len(encoded) > max_output_bytes:
+            raise RuntimeError("encoded upscale output exceeds configured limit")
         return Response(encoded, media_type="image/png")
     except Exception as exc:
         logger.exception("upscale worker failed: model=%s", model)

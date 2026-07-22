@@ -23,7 +23,9 @@ def unload() -> dict[str, object]:
 async def upscale(file: UploadFile, outscale: float, model: str, tile: int) -> Response:
     data = await file.read()
     with Image.open(BytesIO(data)) as image:
-        output_image = image.resize((round(image.width * outscale), round(image.height * outscale)))
+        output_image = image.convert("RGB").resize(
+            (round(image.width * outscale), round(image.height * outscale))
+        )
         output = BytesIO()
         output_image.save(output, "PNG")
     return Response(output.getvalue(), media_type="image/png")
