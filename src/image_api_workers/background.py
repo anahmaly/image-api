@@ -101,22 +101,22 @@ def validate_sam2_mask(mask: Image.Image, expected_size: tuple[int, int]) -> Non
         raise ValueError("SAM guidance mask dimensions are invalid")
     values = tuple(mask.getdata())
     if not values or any(
-        not isinstance(value, (int, float)) or not math.isfinite(value) for value in values
+        not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= float(value) <= 1
+        for value in values
     ):
-        raise ValueError("SAM guidance mask contains non-finite values")
-    if not any(value > 0 for value in values) or not any(value <= 0 for value in values):
-        raise ValueError("SAM guidance mask must contain foreground and background")
+        raise ValueError("SAM guidance mask contains invalid probabilities")
 
 
 def _binary_sam2_mask(
     probability: Image.Image, threshold: float, size: tuple[int, int]
 ) -> Image.Image:
     validate_sam2_mask(probability, size)
-    return Image.frombytes(
-        "L",
-        size,
-        bytes(255 if float(value) >= threshold else 0 for value in probability.getdata()),
-    )
+    binary = bytes(255 if float(value) >= threshold else 0 for value in probability.getdata())
+    if not any(binary) or all(binary):
+        raise ValueError("SAM guidance mask must contain foreground and background")
+    return Image.frombytes("L", size, binary)
 
 
 def fuse_sam2_guidance(

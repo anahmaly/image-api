@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 import sys
 from io import BytesIO
 
@@ -57,16 +58,27 @@ def test_guidance_fusion_preserves_hard_regions_and_gamma_unknown() -> None:
 
 
 @pytest.mark.parametrize(
-    "mask",
+    ("probability", "size"),
     [
-        Image.new("L", (3, 2), 0),
-        Image.new("L", (3, 2), 255),
-        Image.frombytes("F", (3, 2), b"\x00" * 24),
+        (Image.new("F", (2, 2), 0.5), (3, 2)),
+        (Image.frombytes("F", (3, 2), struct.pack("6f", float("nan"), *([0.5] * 5))), (3, 2)),
+        (Image.new("F", (3, 2), 1.1), (3, 2)),
+        (Image.new("F", (3, 2), 1.0), (3, 2)),
+        (Image.new("F", (3, 2), 0.0), (3, 2)),
     ],
+    ids=["wrong-size", "non-finite", "out-of-range", "all-one", "all-zero"],
 )
-def test_invalid_sam_masks_fail_explicitly(mask: Image.Image) -> None:
+def test_invalid_sam_masks_fail_explicitly(probability: Image.Image, size: tuple[int, int]) -> None:
     with pytest.raises(ValueError, match="SAM"):
-        background.validate_sam2_mask(mask, (3, 2))
+        background._binary_sam2_mask(probability, threshold=0.5, size=size)
+
+
+def test_binary_sam2_mask_accepts_ordinary_probabilities_before_thresholding() -> None:
+    probability = Image.frombytes("F", (2, 1), struct.pack("2f", 0.1, 0.9))
+
+    mask = background._binary_sam2_mask(probability, threshold=0.5, size=(2, 1))
+
+    assert list(mask.getdata()) == [0, 255]
 
 
 def test_guidance_off_does_not_create_sam_adapter(monkeypatch) -> None:
