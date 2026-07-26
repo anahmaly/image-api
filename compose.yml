@@ -147,6 +147,7 @@ services:
       IMAGE_API_BRIA_WEIGHTS_PATH: /models/bria-rmbg-2.0
       IMAGE_API_BIREFNET_WEIGHTS_PATH: /models/birefnet-hr
       IMAGE_API_BIREFNET_REVISION: 5d6b6f8adcb5b417c871b1d84ceaae9871355b7f
+      IMAGE_API_SAM2_CHECKPOINT_PATH: /models/sam2.1-hiera-large/sam2.1_hiera_large.pt
       IMAGE_API_STATE_DIR: /state
       IMAGE_API_ENABLE_PROCESSING_RUNNER: "true"
       IMAGE_API_MAX_QUEUE_DEPTH: ${IMAGE_API_MAX_QUEUE_DEPTH:-100}
@@ -168,6 +169,7 @@ services:
     volumes:
       - ${IMAGE_API_BRIA_WEIGHTS_HOST_PATH:-./models/bria-rmbg-2.0}:/models/bria-rmbg-2.0:ro
       - ${IMAGE_API_BIREFNET_WEIGHTS_HOST_PATH:-./models/birefnet-hr}:/models/birefnet-hr:ro
+      - ${IMAGE_API_SAM2_WEIGHTS_HOST_PATH:-./models/sam2.1-hiera-large}:/models/sam2.1-hiera-large:ro
       - image-api-state:/state
     gpus: all
     depends_on:
