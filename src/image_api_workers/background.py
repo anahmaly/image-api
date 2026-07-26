@@ -5,15 +5,16 @@ import atexit
 import gc
 import io
 import logging
+import math
 import os
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, AsyncIterator, Literal
+from typing import Annotated, Any, AsyncIterator, Literal, Protocol
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from image_api.images import validate_dimensions
 from image_api.config import Settings
@@ -31,6 +32,124 @@ from image_api_workers.uploads import read_bounded_upload
 logger = logging.getLogger(__name__)
 _active_model: str | None = None
 _model_lock = threading.RLock()
+
+
+class Sam2Adapter(Protocol):
+    """Small injectable boundary around the locally installed SAM 2 runtime."""
+
+    def predict_probability(
+        self, source: Image.Image, box: tuple[int, int, int, int]
+    ) -> Image.Image: ...
+    def release(self) -> None: ...
+
+
+class LocalSam2Adapter:
+    def __init__(self, checkpoint: Path) -> None:
+        if not checkpoint.is_file():
+            raise RuntimeError("SAM guidance checkpoint is unavailable")
+        try:
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+        except ImportError as exc:
+            raise RuntimeError("SAM guidance runtime is unavailable") from exc
+        self._predictor = SAM2ImagePredictor(
+            build_sam2("configs/sam2.1/sam2.1_hiera_l.yaml", str(checkpoint), device="cuda")
+        )
+
+    def predict_probability(
+        self, source: Image.Image, box: tuple[int, int, int, int]
+    ) -> Image.Image:
+        import numpy as np
+
+        self._predictor.set_image(np.asarray(source.convert("RGB")))
+        masks, scores, _ = self._predictor.predict(
+            box=np.asarray(box), multimask_output=True, return_logits=True
+        )
+        score_index = max(range(len(scores)), key=lambda index: (float(scores[index]), -index))
+        selected = np.asarray(masks[score_index], dtype=np.float32)
+        probability = 1.0 / (1.0 + np.exp(-selected))
+        return Image.fromarray(probability, mode="F")
+
+    def release(self) -> None:
+        self._predictor = None
+
+
+_sam2_adapter: Sam2Adapter | None = None
+
+
+def _create_sam2_adapter() -> Sam2Adapter:
+    checkpoint = Path(
+        os.getenv(
+            "IMAGE_API_SAM2_CHECKPOINT_PATH",
+            "/models/sam2.1-hiera-large/sam2.1_hiera_large.pt",
+        )
+    )
+    return LocalSam2Adapter(checkpoint)
+
+
+def sam2_prompt_box(alpha: Image.Image, threshold: int) -> tuple[int, int, int, int]:
+    selected = alpha.convert("L").point(lambda value: 255 if value >= threshold else 0)
+    bounds = selected.getbbox()
+    if bounds is None:
+        raise ValueError("SAM guidance prompt has no foreground pixels")
+    left, top, right, bottom = bounds
+    return left, top, right - 1, bottom - 1
+
+
+def validate_sam2_mask(mask: Image.Image, expected_size: tuple[int, int]) -> None:
+    if mask.size != expected_size:
+        raise ValueError("SAM guidance mask dimensions are invalid")
+    values = tuple(mask.getdata())
+    if not values or any(
+        not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= float(value) <= 1
+        for value in values
+    ):
+        raise ValueError("SAM guidance mask contains invalid probabilities")
+
+
+def _binary_sam2_mask(
+    probability: Image.Image, threshold: float, size: tuple[int, int]
+) -> Image.Image:
+    validate_sam2_mask(probability, size)
+    binary = bytes(255 if float(value) >= threshold else 0 for value in probability.getdata())
+    if not any(binary) or all(binary):
+        raise ValueError("SAM guidance mask must contain foreground and background")
+    return Image.frombytes("L", size, binary)
+
+
+def fuse_sam2_guidance(
+    source: Image.Image,
+    provisional_alpha: Image.Image,
+    sam_mask: Image.Image,
+    *,
+    interior_erode: int,
+    boundary_dilate: int,
+    boundary_alpha_gamma: float,
+) -> Image.Image:
+    size = source.size
+    if provisional_alpha.size != size or sam_mask.size != size:
+        raise ValueError("SAM guidance dimensions are invalid")
+    sure_foreground = sam_mask.convert("L")
+    if interior_erode:
+        sure_foreground = sure_foreground.filter(ImageFilter.MinFilter(interior_erode * 2 + 1))
+    dilated = sam_mask.convert("L")
+    if boundary_dilate:
+        dilated = dilated.filter(ImageFilter.MaxFilter(boundary_dilate * 2 + 1))
+    sure_background = dilated.point(lambda value: 0 if value else 255)
+    lut = [
+        min(255, max(0, int(255 * (value / 255) ** boundary_alpha_gamma + 0.5)))
+        for value in range(256)
+    ]
+    alpha = provisional_alpha.convert("L").point(lut)
+    alpha.paste(255, mask=sure_foreground)
+    alpha.paste(0, mask=sure_background)
+    result = source.convert("RGBA")
+    result.putalpha(alpha)
+    hidden = Image.new("RGBA", size, (0, 0, 0, 0))
+    result.paste(hidden, mask=alpha.point(lambda value: 255 if value == 0 else 0))
+    return result
 
 
 def _birefnet_config() -> Any:
@@ -51,9 +170,16 @@ def _birefnet_config() -> Any:
 
 
 def _release_resident_models() -> None:
-    global _active_model
+    global _active_model, _sam2_adapter
     with _model_lock:
         release_errors: list[BaseException] = []
+        if _sam2_adapter is not None:
+            try:
+                _sam2_adapter.release()
+            except Exception as exc:
+                release_errors.append(exc)
+                logger.exception("SAM guidance release failed")
+            _sam2_adapter = None
         try:
             from rembg_api.birefnet_hr import clear_cache
 
@@ -119,6 +245,13 @@ def _run_background(
     despill_enabled: bool = False,
     despill_color: str = "black",
     despill_hex_color: str = "000000",
+    sam2_guidance: bool = False,
+    sam2_model: str = "sam2.1-hiera-large",
+    sam2_mask_threshold: float = 0.5,
+    sam2_prompt_alpha_threshold: int = 128,
+    sam2_interior_erode: int = 4,
+    sam2_boundary_dilate: int = 8,
+    boundary_alpha_gamma: float = 0.6,
 ) -> bytes:
     global _active_model
     if not 512 <= birefnet_inference_size <= 4096:
@@ -179,6 +312,35 @@ def _run_background(
     )
     if not isinstance(encoded, bytes):
         raise RuntimeError("background post-processing returned invalid bytes")
+    if sam2_guidance:
+        if model != "birefnet-hr-matting" or sam2_model != "sam2.1-hiera-large":
+            raise ValueError("SAM guidance requires the supported BiRefNet model")
+        if not 0 <= sam2_mask_threshold <= 1 or not math.isfinite(sam2_mask_threshold):
+            raise ValueError("invalid SAM guidance mask threshold")
+        global _sam2_adapter
+        with (
+            Image.open(io.BytesIO(data)) as original,
+            Image.open(io.BytesIO(encoded)) as processed,
+        ):
+            original.load()
+            processed.load()
+            adapter = _sam2_adapter or _create_sam2_adapter()
+            _sam2_adapter = adapter
+            probability = adapter.predict_probability(
+                original.convert("RGB"),
+                sam2_prompt_box(processed.getchannel("A"), sam2_prompt_alpha_threshold),
+            )
+            guided = fuse_sam2_guidance(
+                processed.convert("RGB"),
+                processed.getchannel("A"),
+                _binary_sam2_mask(probability, sam2_mask_threshold, expected_size),
+                interior_erode=sam2_interior_erode,
+                boundary_dilate=sam2_boundary_dilate,
+                boundary_alpha_gamma=boundary_alpha_gamma,
+            )
+            guided_output = io.BytesIO()
+            guided.save(guided_output, "PNG")
+            encoded = guided_output.getvalue()
     with Image.open(io.BytesIO(encoded)) as output:
         output.load()
         if output.mode != "RGBA":
@@ -258,6 +420,13 @@ def start_durable_runner() -> bool:
             despill_enabled = request.get("despill_enabled")
             despill_color = request.get("despill_color")
             despill_hex_color = request.get("despill_hex_color")
+            sam2_guidance = request.get("sam2_guidance", False)
+            sam2_model = request.get("sam2_model", "sam2.1-hiera-large")
+            sam2_mask_threshold = request.get("sam2_mask_threshold", 0.5)
+            sam2_prompt_alpha_threshold = request.get("sam2_prompt_alpha_threshold", 128)
+            sam2_interior_erode = request.get("sam2_interior_erode", 4)
+            sam2_boundary_dilate = request.get("sam2_boundary_dilate", 8)
+            boundary_alpha_gamma = request.get("boundary_alpha_gamma", 0.6)
             if (
                 model_name not in {"bria-rmbg-2.0", "birefnet-hr-matting"}
                 or not isinstance(model_name, str)
@@ -278,6 +447,23 @@ def start_durable_runner() -> bool:
                 or despill_color not in {"black", "white", "green", "blue", "custom"}
                 or not isinstance(despill_color, str)
                 or not isinstance(despill_hex_color, str)
+                or type(sam2_guidance) is not bool
+                or sam2_model != "sam2.1-hiera-large"
+                or not isinstance(sam2_model, str)
+                or not isinstance(sam2_mask_threshold, (int, float))
+                or isinstance(sam2_mask_threshold, bool)
+                or not 0 <= float(sam2_mask_threshold) <= 1
+                or not math.isfinite(float(sam2_mask_threshold))
+                or type(sam2_prompt_alpha_threshold) is not int
+                or not 1 <= sam2_prompt_alpha_threshold <= 255
+                or type(sam2_interior_erode) is not int
+                or not 0 <= sam2_interior_erode <= 64
+                or type(sam2_boundary_dilate) is not int
+                or not 0 <= sam2_boundary_dilate <= 64
+                or not isinstance(boundary_alpha_gamma, (int, float))
+                or isinstance(boundary_alpha_gamma, bool)
+                or not 0.1 <= float(boundary_alpha_gamma) <= 4
+                or not math.isfinite(float(boundary_alpha_gamma))
             ):
                 raise ValueError("invalid persisted background-removal parameters")
             assert type(alpha_erode) is int
@@ -287,6 +473,11 @@ def start_durable_runner() -> bool:
             assert type(model_input_size) is int
             assert type(refinement) is bool
             assert type(despill_enabled) is bool
+            assert type(sam2_guidance) is bool
+            assert isinstance(sam2_model, str)
+            assert type(sam2_prompt_alpha_threshold) is int
+            assert type(sam2_interior_erode) is int
+            assert type(sam2_boundary_dilate) is int
             with _model_lock:
                 return _run_background(
                     data,
@@ -301,6 +492,13 @@ def start_durable_runner() -> bool:
                     despill_enabled=despill_enabled,
                     despill_color=despill_color,
                     despill_hex_color=despill_hex_color,
+                    sam2_guidance=sam2_guidance,
+                    sam2_model=sam2_model,
+                    sam2_mask_threshold=float(sam2_mask_threshold),
+                    sam2_prompt_alpha_threshold=sam2_prompt_alpha_threshold,
+                    sam2_interior_erode=sam2_interior_erode,
+                    sam2_boundary_dilate=sam2_boundary_dilate,
+                    boundary_alpha_gamma=float(boundary_alpha_gamma),
                 )
 
         return ProcessingRunner(
@@ -367,6 +565,13 @@ async def remove_background(
     birefnet_inference_size: Annotated[int, Query(ge=512, le=4096)] = 2048,
     birefnet_foreground_refinement: bool = False,
     model_input_size: Annotated[int, Query(ge=512, le=2048)] = 1024,
+    sam2_guidance: bool = False,
+    sam2_model: Literal["sam2.1-hiera-large"] = "sam2.1-hiera-large",
+    sam2_mask_threshold: Annotated[float, Query(ge=0, le=1)] = 0.5,
+    sam2_prompt_alpha_threshold: Annotated[int, Query(ge=1, le=255)] = 128,
+    sam2_interior_erode: Annotated[int, Query(ge=0, le=64)] = 4,
+    sam2_boundary_dilate: Annotated[int, Query(ge=0, le=64)] = 8,
+    boundary_alpha_gamma: Annotated[float, Query(ge=0.1, le=4)] = 0.6,
 ) -> Response:
     max_upload_bytes = int(os.getenv("IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES", "280000000"))
     data = await read_bounded_upload(file, max_upload_bytes)
@@ -390,6 +595,13 @@ async def remove_background(
                     birefnet_inference_size=birefnet_inference_size,
                     birefnet_foreground_refinement=birefnet_foreground_refinement,
                     model_input_size=model_input_size,
+                    sam2_guidance=sam2_guidance,
+                    sam2_model=sam2_model,
+                    sam2_mask_threshold=sam2_mask_threshold,
+                    sam2_prompt_alpha_threshold=sam2_prompt_alpha_threshold,
+                    sam2_interior_erode=sam2_interior_erode,
+                    sam2_boundary_dilate=sam2_boundary_dilate,
+                    boundary_alpha_gamma=boundary_alpha_gamma,
                 )
 
         encoded = await asyncio.to_thread(

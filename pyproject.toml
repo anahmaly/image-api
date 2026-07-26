@@ -46,6 +46,7 @@ module = [
   "numpy",
   "realesrgan",
   "rembg_api.*",
+  "sam2.*",
   "torch",
 ]
 ignore_missing_imports = true
