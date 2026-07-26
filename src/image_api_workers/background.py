@@ -62,9 +62,11 @@ class LocalSam2Adapter:
         import numpy as np
 
         self._predictor.set_image(np.asarray(source.convert("RGB")))
-        _, scores, logits = self._predictor.predict(box=np.asarray(box), multimask_output=True)
+        masks, scores, _ = self._predictor.predict(
+            box=np.asarray(box), multimask_output=True, return_logits=True
+        )
         score_index = max(range(len(scores)), key=lambda index: (float(scores[index]), -index))
-        selected = np.asarray(logits[score_index], dtype=np.float32)
+        selected = np.asarray(masks[score_index], dtype=np.float32)
         probability = 1.0 / (1.0 + np.exp(-selected))
         return Image.fromarray(probability, mode="F")
 
@@ -110,7 +112,11 @@ def _binary_sam2_mask(
     probability: Image.Image, threshold: float, size: tuple[int, int]
 ) -> Image.Image:
     validate_sam2_mask(probability, size)
-    return probability.point(lambda value: 255 if float(value) >= threshold else 0).convert("L")
+    return Image.frombytes(
+        "L",
+        size,
+        bytes(255 if float(value) >= threshold else 0 for value in probability.getdata()),
+    )
 
 
 def fuse_sam2_guidance(
@@ -280,35 +286,6 @@ def _run_background(
         raise ValueError("unsupported background-removal model")
     if not isinstance(removed, bytes):
         raise RuntimeError("background backend returned invalid bytes")
-    if sam2_guidance:
-        if model != "birefnet-hr-matting" or sam2_model != "sam2.1-hiera-large":
-            raise ValueError("SAM guidance requires the supported BiRefNet model")
-        if not 0 <= sam2_mask_threshold <= 1 or not math.isfinite(sam2_mask_threshold):
-            raise ValueError("invalid SAM guidance mask threshold")
-        global _sam2_adapter
-        with (
-            Image.open(io.BytesIO(data)) as original,
-            Image.open(io.BytesIO(removed)) as provisional,
-        ):
-            original.load()
-            provisional.load()
-            adapter = _sam2_adapter or _create_sam2_adapter()
-            _sam2_adapter = adapter
-            probability = adapter.predict_probability(
-                original.convert("RGB"),
-                sam2_prompt_box(provisional.getchannel("A"), sam2_prompt_alpha_threshold),
-            )
-            guided = fuse_sam2_guidance(
-                original.convert("RGB"),
-                provisional.getchannel("A"),
-                _binary_sam2_mask(probability, sam2_mask_threshold, expected_size),
-                interior_erode=sam2_interior_erode,
-                boundary_dilate=sam2_boundary_dilate,
-                boundary_alpha_gamma=boundary_alpha_gamma,
-            )
-            guided_output = io.BytesIO()
-            guided.save(guided_output, "PNG")
-            removed = guided_output.getvalue()
     from rembg_api.image_processing import AlphaOptions, DespillOptions, process_png_bytes
 
     encoded = process_png_bytes(
@@ -335,6 +312,35 @@ def _run_background(
     )
     if not isinstance(encoded, bytes):
         raise RuntimeError("background post-processing returned invalid bytes")
+    if sam2_guidance:
+        if model != "birefnet-hr-matting" or sam2_model != "sam2.1-hiera-large":
+            raise ValueError("SAM guidance requires the supported BiRefNet model")
+        if not 0 <= sam2_mask_threshold <= 1 or not math.isfinite(sam2_mask_threshold):
+            raise ValueError("invalid SAM guidance mask threshold")
+        global _sam2_adapter
+        with (
+            Image.open(io.BytesIO(data)) as original,
+            Image.open(io.BytesIO(encoded)) as processed,
+        ):
+            original.load()
+            processed.load()
+            adapter = _sam2_adapter or _create_sam2_adapter()
+            _sam2_adapter = adapter
+            probability = adapter.predict_probability(
+                original.convert("RGB"),
+                sam2_prompt_box(processed.getchannel("A"), sam2_prompt_alpha_threshold),
+            )
+            guided = fuse_sam2_guidance(
+                processed.convert("RGB"),
+                processed.getchannel("A"),
+                _binary_sam2_mask(probability, sam2_mask_threshold, expected_size),
+                interior_erode=sam2_interior_erode,
+                boundary_dilate=sam2_boundary_dilate,
+                boundary_alpha_gamma=boundary_alpha_gamma,
+            )
+            guided_output = io.BytesIO()
+            guided.save(guided_output, "PNG")
+            encoded = guided_output.getvalue()
     with Image.open(io.BytesIO(encoded)) as output:
         output.load()
         if output.mode != "RGBA":
@@ -414,6 +420,13 @@ def start_durable_runner() -> bool:
             despill_enabled = request.get("despill_enabled")
             despill_color = request.get("despill_color")
             despill_hex_color = request.get("despill_hex_color")
+            sam2_guidance = request.get("sam2_guidance", False)
+            sam2_model = request.get("sam2_model", "sam2.1-hiera-large")
+            sam2_mask_threshold = request.get("sam2_mask_threshold", 0.5)
+            sam2_prompt_alpha_threshold = request.get("sam2_prompt_alpha_threshold", 128)
+            sam2_interior_erode = request.get("sam2_interior_erode", 4)
+            sam2_boundary_dilate = request.get("sam2_boundary_dilate", 8)
+            boundary_alpha_gamma = request.get("boundary_alpha_gamma", 0.6)
             if (
                 model_name not in {"bria-rmbg-2.0", "birefnet-hr-matting"}
                 or not isinstance(model_name, str)
@@ -434,6 +447,23 @@ def start_durable_runner() -> bool:
                 or despill_color not in {"black", "white", "green", "blue", "custom"}
                 or not isinstance(despill_color, str)
                 or not isinstance(despill_hex_color, str)
+                or type(sam2_guidance) is not bool
+                or sam2_model != "sam2.1-hiera-large"
+                or not isinstance(sam2_model, str)
+                or not isinstance(sam2_mask_threshold, (int, float))
+                or isinstance(sam2_mask_threshold, bool)
+                or not 0 <= float(sam2_mask_threshold) <= 1
+                or not math.isfinite(float(sam2_mask_threshold))
+                or type(sam2_prompt_alpha_threshold) is not int
+                or not 1 <= sam2_prompt_alpha_threshold <= 255
+                or type(sam2_interior_erode) is not int
+                or not 0 <= sam2_interior_erode <= 64
+                or type(sam2_boundary_dilate) is not int
+                or not 0 <= sam2_boundary_dilate <= 64
+                or not isinstance(boundary_alpha_gamma, (int, float))
+                or isinstance(boundary_alpha_gamma, bool)
+                or not 0.1 <= float(boundary_alpha_gamma) <= 4
+                or not math.isfinite(float(boundary_alpha_gamma))
             ):
                 raise ValueError("invalid persisted background-removal parameters")
             assert type(alpha_erode) is int
@@ -443,6 +473,11 @@ def start_durable_runner() -> bool:
             assert type(model_input_size) is int
             assert type(refinement) is bool
             assert type(despill_enabled) is bool
+            assert type(sam2_guidance) is bool
+            assert isinstance(sam2_model, str)
+            assert type(sam2_prompt_alpha_threshold) is int
+            assert type(sam2_interior_erode) is int
+            assert type(sam2_boundary_dilate) is int
             with _model_lock:
                 return _run_background(
                     data,
@@ -457,6 +492,13 @@ def start_durable_runner() -> bool:
                     despill_enabled=despill_enabled,
                     despill_color=despill_color,
                     despill_hex_color=despill_hex_color,
+                    sam2_guidance=sam2_guidance,
+                    sam2_model=sam2_model,
+                    sam2_mask_threshold=float(sam2_mask_threshold),
+                    sam2_prompt_alpha_threshold=sam2_prompt_alpha_threshold,
+                    sam2_interior_erode=sam2_interior_erode,
+                    sam2_boundary_dilate=sam2_boundary_dilate,
+                    boundary_alpha_gamma=float(boundary_alpha_gamma),
                 )
 
         return ProcessingRunner(

@@ -753,6 +753,13 @@ def create_app(
             Literal["black", "white", "green", "blue", "custom"], Query()
         ] = "black",
         despill_hex_color: Annotated[str, Query(pattern="^[0-9A-Fa-f]{6}$")] = "000000",
+        sam2_guidance: bool = False,
+        sam2_model: Literal["sam2.1-hiera-large"] = "sam2.1-hiera-large",
+        sam2_mask_threshold: Annotated[float, Query(ge=0, le=1)] = 0.5,
+        sam2_prompt_alpha_threshold: Annotated[int, Query(ge=1, le=255)] = 128,
+        sam2_interior_erode: Annotated[int, Query(ge=0, le=64)] = 4,
+        sam2_boundary_dilate: Annotated[int, Query(ge=0, le=64)] = 8,
+        boundary_alpha_gamma: Annotated[float, Query(ge=0.1, le=4)] = 0.6,
     ) -> dict[str, object]:
         if not IDEMPOTENCY_PATTERN.fullmatch(idempotency_key):
             await file.close()
@@ -780,6 +787,13 @@ def create_app(
                 "despill_enabled": despill_enabled,
                 "despill_color": despill_color,
                 "despill_hex_color": despill_hex_color.lower(),
+                "sam2_guidance": sam2_guidance,
+                "sam2_model": sam2_model,
+                "sam2_mask_threshold": sam2_mask_threshold,
+                "sam2_prompt_alpha_threshold": sam2_prompt_alpha_threshold,
+                "sam2_interior_erode": sam2_interior_erode,
+                "sam2_boundary_dilate": sam2_boundary_dilate,
+                "boundary_alpha_gamma": boundary_alpha_gamma,
                 "source_image_name": source_name,
                 "source_image_sha256": source_hash,
                 "source_identity_sha256": source_hash,
