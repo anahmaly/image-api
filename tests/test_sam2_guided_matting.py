@@ -38,10 +38,10 @@ def test_public_background_forwards_sam2_guidance_contract(tmp_path) -> None:
     assert worker.last_background["boundary_alpha_gamma"] == 0.5
 
 
-def test_guidance_fusion_preserves_hard_regions_and_gamma_unknown() -> None:
+def test_guidance_fusion_is_pixelwise_monotonic_for_fragmented_sam_support() -> None:
     source = Image.new("RGB", (5, 1), (9, 8, 7))
-    provisional = Image.frombytes("L", (5, 1), bytes([0, 64, 128, 255, 255]))
-    sam_mask = Image.frombytes("L", (5, 1), bytes([0, 255, 255, 255, 0]))
+    provisional = Image.frombytes("L", (5, 1), bytes([0, 64, 96, 255, 64]))
+    sam_mask = Image.frombytes("L", (5, 1), bytes([0, 0, 0, 255, 0]))
 
     fused = background.fuse_sam2_guidance(
         source,
@@ -50,11 +50,64 @@ def test_guidance_fusion_preserves_hard_regions_and_gamma_unknown() -> None:
         interior_erode=0,
         boundary_dilate=0,
         boundary_alpha_gamma=0.5,
+        provisional_foreground_threshold=128,
     )
 
-    assert list(fused.getchannel("A").getdata()) == [0, 255, 255, 255, 0]
+    adjusted = [0, 128, 156, 255, 128]
+    alpha = list(fused.getchannel("A").getdata())
+    assert all(final >= before for final, before in zip(alpha, adjusted, strict=True))
+    assert alpha == adjusted
     assert fused.getpixel((0, 0))[:3] == (0, 0, 0)
     assert fused.getpixel((2, 0))[:3] == (9, 8, 7)
+
+
+def test_guidance_fills_hole_wider_than_closing_diameter_without_filling_border_background() -> None:
+    source = Image.new("RGB", (15, 15), (9, 8, 7))
+    provisional = Image.new("L", (15, 15), 0)
+    sam_mask = Image.new("L", (15, 15), 0)
+    for x in range(3, 12):
+        sam_mask.putpixel((x, 3), 255)
+        sam_mask.putpixel((x, 11), 255)
+    for y in range(3, 12):
+        sam_mask.putpixel((3, y), 255)
+        sam_mask.putpixel((11, y), 255)
+
+    fused = background.fuse_sam2_guidance(
+        source,
+        provisional,
+        sam_mask,
+        interior_erode=0,
+        boundary_dilate=1,
+        boundary_alpha_gamma=1.0,
+        provisional_foreground_threshold=128,
+    )
+
+    alpha = fused.getchannel("A")
+    assert alpha.getpixel((5, 5)) == 255
+    assert alpha.getpixel((0, 5)) == 0
+    assert alpha.getpixel((14, 14)) == 0
+
+
+def test_high_confidence_provisional_outside_eroded_support_remains_soft() -> None:
+    source = Image.new("RGB", (7, 7), (9, 8, 7))
+    provisional = Image.new("L", (7, 7), 0)
+    provisional.putpixel((5, 5), 200)
+    sam_mask = Image.new("L", (7, 7), 0)
+    for x in range(1, 4):
+        for y in range(1, 4):
+            sam_mask.putpixel((x, y), 255)
+
+    fused = background.fuse_sam2_guidance(
+        source,
+        provisional,
+        sam_mask,
+        interior_erode=1,
+        boundary_dilate=0,
+        boundary_alpha_gamma=0.5,
+        provisional_foreground_threshold=128,
+    )
+
+    assert fused.getchannel("A").getpixel((5, 5)) == 226
 
 
 @pytest.mark.parametrize(
@@ -126,7 +179,7 @@ def test_local_adapter_selects_best_full_resolution_logits_as_probabilities(monk
     assert probability.getpixel((0, 0)) == pytest.approx(0.5)
 
 
-def test_guided_postprocessing_keeps_final_sam_hard_alpha_regions(monkeypatch) -> None:
+def test_guided_postprocessing_preserves_provisional_foreground_outside_sam_support(monkeypatch) -> None:
     from test_background_worker_adapter import _install_pr7_fakes
 
     calls: list[tuple[str, dict[str, object]]] = []
@@ -171,8 +224,9 @@ def test_guided_postprocessing_keeps_final_sam_hard_alpha_regions(monkeypatch) -
 
     with Image.open(BytesIO(encoded)) as output:
         alpha = output.getchannel("A")
-        assert alpha.getpixel((0, 3)) == 0
+        assert alpha.getpixel((0, 3)) == 255
         assert alpha.getpixel((1, 3)) == 255
+        assert output.getpixel((0, 3))[:3] == (10, 20, 30)
 
 
 def test_durable_runner_forwards_persisted_sam_contract(monkeypatch, tmp_path) -> None:

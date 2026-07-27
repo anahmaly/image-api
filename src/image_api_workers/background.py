@@ -14,7 +14,7 @@ from typing import Annotated, Any, AsyncIterator, Literal, Protocol
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 
 from image_api.images import validate_dimensions
 from image_api.config import Settings
@@ -119,6 +119,31 @@ def _binary_sam2_mask(
     return Image.frombytes("L", size, binary)
 
 
+def _fill_enclosed_holes(support: Image.Image) -> Image.Image:
+    """Return binary support with only border-disconnected background filled."""
+    background = support.point(lambda value: 255 if value == 0 else 0)
+    width, height = support.size
+    border_pixels = [
+        *((x, 0) for x in range(width)),
+        *((x, height - 1) for x in range(width)),
+        *((0, y) for y in range(1, height - 1)),
+        *((width - 1, y) for y in range(1, height - 1)),
+    ]
+    for coordinate in border_pixels:
+        if background.getpixel(coordinate) == 255:
+            ImageDraw.floodfill(background, coordinate, 128, border=0)
+    return Image.frombytes(
+        "L", support.size, bytes(0 if value == 128 else 255 for value in background.getdata())
+    )
+
+
+def _validate_monotonic_alpha(final_alpha: Image.Image, adjusted_alpha: Image.Image) -> None:
+    if final_alpha.size != adjusted_alpha.size or any(
+        final < adjusted for final, adjusted in zip(final_alpha.getdata(), adjusted_alpha.getdata())
+    ):
+        raise RuntimeError("SAM guidance produced destructive alpha")
+
+
 def fuse_sam2_guidance(
     source: Image.Image,
     provisional_alpha: Image.Image,
@@ -127,24 +152,53 @@ def fuse_sam2_guidance(
     interior_erode: int,
     boundary_dilate: int,
     boundary_alpha_gamma: float,
+    provisional_foreground_threshold: int,
 ) -> Image.Image:
+    """Strengthen credible foreground without ever reducing adjusted matting alpha.
+
+    ``boundary_dilate`` is a bounded binary closing radius. SAM support and
+    high-confidence provisional support are unioned before closing; enclosed
+    background is then filled before ``interior_erode`` defines the conservative
+    core. Only that core becomes opaque, so adjusted provisional alpha stays soft
+    wherever it is outside the conservative support.
+    """
     size = source.size
     if provisional_alpha.size != size or sam_mask.size != size:
         raise ValueError("SAM guidance dimensions are invalid")
-    sure_foreground = sam_mask.convert("L")
-    if interior_erode:
-        sure_foreground = sure_foreground.filter(ImageFilter.MinFilter(interior_erode * 2 + 1))
-    dilated = sam_mask.convert("L")
-    if boundary_dilate:
-        dilated = dilated.filter(ImageFilter.MaxFilter(boundary_dilate * 2 + 1))
-    sure_background = dilated.point(lambda value: 0 if value else 255)
+    if not 0 <= provisional_foreground_threshold <= 255:
+        raise ValueError("SAM guidance provisional threshold is invalid")
+    if interior_erode < 0 or boundary_dilate < 0:
+        raise ValueError("SAM guidance morphology radius is invalid")
+
     lut = [
         min(255, max(0, int(255 * (value / 255) ** boundary_alpha_gamma + 0.5)))
         for value in range(256)
     ]
-    alpha = provisional_alpha.convert("L").point(lut)
+    adjusted_alpha = provisional_alpha.convert("L").point(lut)
+    provisional_support = provisional_alpha.convert("L").point(
+        lambda value: 255 if value >= provisional_foreground_threshold else 0
+    )
+    support = Image.frombytes(
+        "L",
+        size,
+        bytes(
+            255 if sam_value or provisional_value else 0
+            for sam_value, provisional_value in zip(
+                sam_mask.convert("L").getdata(), provisional_support.getdata()
+            )
+        ),
+    )
+    if boundary_dilate:
+        kernel = boundary_dilate * 2 + 1
+        support = support.filter(ImageFilter.MaxFilter(kernel)).filter(ImageFilter.MinFilter(kernel))
+    sure_foreground = _fill_enclosed_holes(support)
+    if interior_erode:
+        sure_foreground = sure_foreground.filter(ImageFilter.MinFilter(interior_erode * 2 + 1))
+
+    alpha = adjusted_alpha.copy()
     alpha.paste(255, mask=sure_foreground)
-    alpha.paste(0, mask=sure_background)
+    _validate_monotonic_alpha(alpha, adjusted_alpha)
+
     result = source.convert("RGBA")
     result.putalpha(alpha)
     hidden = Image.new("RGBA", size, (0, 0, 0, 0))
@@ -331,12 +385,13 @@ def _run_background(
                 sam2_prompt_box(processed.getchannel("A"), sam2_prompt_alpha_threshold),
             )
             guided = fuse_sam2_guidance(
-                processed.convert("RGB"),
+                original.convert("RGB"),
                 processed.getchannel("A"),
                 _binary_sam2_mask(probability, sam2_mask_threshold, expected_size),
                 interior_erode=sam2_interior_erode,
                 boundary_dilate=sam2_boundary_dilate,
                 boundary_alpha_gamma=boundary_alpha_gamma,
+                provisional_foreground_threshold=sam2_prompt_alpha_threshold,
             )
             guided_output = io.BytesIO()
             guided.save(guided_output, "PNG")
