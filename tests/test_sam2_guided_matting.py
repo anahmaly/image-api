@@ -3,6 +3,7 @@ from __future__ import annotations
 import struct
 import sys
 from io import BytesIO
+from typing import cast
 
 import pytest
 from PIL import Image
@@ -61,9 +62,7 @@ def test_guidance_fusion_is_pixelwise_monotonic_for_fragmented_sam_support() -> 
     assert fused.getpixel((2, 0))[:3] == (9, 8, 7)
 
 
-def test_guidance_fills_hole_wider_than_closing_diameter_without_filling_border_background() -> (
-    None
-):
+def test_guidance_preserves_enclosed_opening_wider_than_closing_kernel() -> None:
     source = Image.new("RGB", (15, 15), (9, 8, 7))
     provisional = Image.new("L", (15, 15), 0)
     sam_mask = Image.new("L", (15, 15), 0)
@@ -85,9 +84,59 @@ def test_guidance_fills_hole_wider_than_closing_diameter_without_filling_border_
     )
 
     alpha = fused.getchannel("A")
-    assert alpha.getpixel((5, 5)) == 255
+    assert alpha.getpixel((3, 7)) == 255
+    assert alpha.getpixel((5, 5)) == 0
     assert alpha.getpixel((0, 5)) == 0
     assert alpha.getpixel((14, 14)) == 0
+
+
+def test_guidance_bounded_closing_repairs_pinhole_within_kernel() -> None:
+    source = Image.new("RGB", (15, 15), (9, 8, 7))
+    provisional = Image.new("L", (15, 15), 0)
+    sam_mask = Image.new("L", (15, 15), 0)
+    for x in range(3, 12):
+        for y in range(3, 12):
+            sam_mask.putpixel((x, y), 255)
+    sam_mask.putpixel((7, 7), 0)
+
+    fused = background.fuse_sam2_guidance(
+        source,
+        provisional,
+        sam_mask,
+        interior_erode=0,
+        boundary_dilate=1,
+        boundary_alpha_gamma=1.0,
+        provisional_foreground_threshold=128,
+    )
+
+    alpha = fused.getchannel("A")
+    assert alpha.getpixel((7, 7)) == 255
+    assert alpha.getpixel((0, 7)) == 0
+
+
+def test_guidance_preserves_soft_provisional_alpha_inside_large_enclosed_opening() -> None:
+    source = Image.new("RGB", (15, 15), (9, 8, 7))
+    provisional = Image.new("L", (15, 15), 0)
+    provisional.putpixel((5, 5), 64)
+    sam_mask = Image.new("L", (15, 15), 0)
+    for x in range(3, 12):
+        sam_mask.putpixel((x, 3), 255)
+        sam_mask.putpixel((x, 11), 255)
+    for y in range(3, 12):
+        sam_mask.putpixel((3, y), 255)
+        sam_mask.putpixel((11, y), 255)
+
+    fused = background.fuse_sam2_guidance(
+        source,
+        provisional,
+        sam_mask,
+        interior_erode=0,
+        boundary_dilate=1,
+        boundary_alpha_gamma=0.5,
+        provisional_foreground_threshold=128,
+    )
+
+    assert fused.getchannel("A").getpixel((5, 5)) == 128
 
 
 def test_high_confidence_provisional_outside_eroded_support_remains_soft() -> None:
@@ -228,6 +277,8 @@ def test_guided_postprocessing_preserves_provisional_foreground_outside_sam_supp
 
     with Image.open(BytesIO(encoded)) as output:
         alpha = output.getchannel("A")
+        adjusted_provisional_alpha = 226
+        assert all(cast(int, final) >= adjusted_provisional_alpha for final in alpha.getdata())
         assert alpha.getpixel((0, 3)) == 255
         assert alpha.getpixel((1, 3)) == 255
         assert output.getpixel((0, 3))[:3] == (10, 20, 30)
