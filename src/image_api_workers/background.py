@@ -14,7 +14,7 @@ from typing import Annotated, Any, AsyncIterator, Literal, Protocol
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageFilter
 
 from image_api.images import validate_dimensions
 from image_api.config import Settings
@@ -119,24 +119,6 @@ def _binary_sam2_mask(
     return Image.frombytes("L", size, binary)
 
 
-def _fill_enclosed_holes(support: Image.Image) -> Image.Image:
-    """Return binary support with only border-disconnected background filled."""
-    background = support.point(lambda value: 255 if value == 0 else 0)
-    width, height = support.size
-    border_pixels = [
-        *((x, 0) for x in range(width)),
-        *((x, height - 1) for x in range(width)),
-        *((0, y) for y in range(1, height - 1)),
-        *((width - 1, y) for y in range(1, height - 1)),
-    ]
-    for coordinate in border_pixels:
-        if background.getpixel(coordinate) == 255:
-            ImageDraw.floodfill(background, coordinate, 128, border=0)
-    return Image.frombytes(
-        "L", support.size, bytes(0 if value == 128 else 255 for value in background.getdata())
-    )
-
-
 def _validate_monotonic_alpha(final_alpha: Image.Image, adjusted_alpha: Image.Image) -> None:
     if final_alpha.size != adjusted_alpha.size or any(
         final < adjusted for final, adjusted in zip(final_alpha.getdata(), adjusted_alpha.getdata())
@@ -157,10 +139,11 @@ def fuse_sam2_guidance(
     """Strengthen credible foreground without ever reducing adjusted matting alpha.
 
     ``boundary_dilate`` is a bounded binary closing radius. SAM support and
-    high-confidence provisional support are unioned before closing; enclosed
-    background is then filled before ``interior_erode`` defines the conservative
-    core. Only that core becomes opaque, so adjusted provisional alpha stays soft
-    wherever it is outside the conservative support.
+    high-confidence provisional support are unioned before closing, then
+    ``interior_erode`` defines the conservative core. Only that core becomes
+    opaque, so adjusted provisional alpha stays soft wherever it is outside the
+    conservative support. Enclosed background wider than the closing kernel
+    remains background.
     """
     size = source.size
     if provisional_alpha.size != size or sam_mask.size != size:
@@ -193,7 +176,7 @@ def fuse_sam2_guidance(
         support = support.filter(ImageFilter.MaxFilter(kernel)).filter(
             ImageFilter.MinFilter(kernel)
         )
-    sure_foreground = _fill_enclosed_holes(support)
+    sure_foreground = support
     if interior_erode:
         sure_foreground = sure_foreground.filter(ImageFilter.MinFilter(interior_erode * 2 + 1))
 
