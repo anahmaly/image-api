@@ -217,6 +217,10 @@ Host-path overrides:
 - `IMAGE_API_LONGCAT_EDIT_WEIGHTS_HOST_PATH` (default `./models/longcat-image-edit`).
 - `IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_HOST_PATH` (default `./models/longcat-image-edit-turbo`).
 - `IMAGE_API_SAM2_WEIGHTS_HOST_PATH` mounts the offline SAM 2.1 Hiera Large checkpoint directory at `/models/sam2.1-hiera-large` (default `./models/sam2.1-hiera-large`). The required file is `sam2.1_hiera_large.pt`; SAM guidance is opt-in and unavailable requests fail safely when this file is absent.
+
+### SAM-guided matting semantics
+
+SAM guidance is a non-destructive opacity repair for BiRefNet output. The gamma-adjusted provisional alpha is the exact per-pixel lower bound: guidance may promote only its conservative support core to exactly opaque and can never reduce or clear provisional foreground. Binary SAM support is unioned with provisional pixels at or above `sam2_prompt_alpha_threshold`, then `sam2_boundary_dilate` performs bounded closing, enclosed holes are filled while border-connected background remains background, and `sam2_interior_erode` derives that core. A high-confidence provisional pixel outside the final core keeps its gamma-adjusted alpha rather than becoming opaque solely because it crossed the prompt threshold. This preserves soft exterior alpha and natural negative space instead of treating SAM background as permission to erase valid matting.
 - `IMAGE_API_IDEOGRAM_WEIGHTS_HOST_PATH`, `IMAGE_API_UPSCALE_WEIGHTS_HOST_PATH`, `IMAGE_API_BRIA_WEIGHTS_HOST_PATH`, and `IMAGE_API_BIREFNET_WEIGHTS_HOST_PATH` retain their existing meanings.
 
 The generation image pins and import-checks `torch==2.11.0`, `torchvision==0.26.0`, `diffusers==0.37.0`, `transformers==4.57.1`, `accelerate==1.11.0`, and `safetensors==0.6.2`, while retaining the official Ideogram adapter at `990fe1c4e950bb9e9dc90e01c0ad98ba434f83c2`.
