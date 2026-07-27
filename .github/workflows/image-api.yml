@@ -28,10 +28,11 @@ jobs:
         run: |
           docker compose config --quiet
           docker compose -f compose.yml -f compose.test.yml config --quiet
-      - name: Build gateway, CPU test worker, and generation runtime
+      - name: Build gateway and worker runtimes
         run: |
           docker build -f Dockerfile.gateway -t image-api-gateway:test .
           docker build -f Dockerfile.test -t image-api-test-worker:test .
           docker build -f Dockerfile.generation -t image-api-generation-worker:test .
+          docker build -f Dockerfile.background -t image-api-background-worker:test .
       - name: Package smoke
         run: uv build

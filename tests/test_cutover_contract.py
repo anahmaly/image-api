@@ -92,6 +92,22 @@ def test_background_install_pins_birefnet_runtime_dependency() -> None:
     )
 
 
+def test_background_sam2_install_uses_verified_source_without_cuda_build_isolation() -> None:
+    background = (ROOT / "Dockerfile.background").read_text().replace("\\\n", " ")
+    sam2_install = next(
+        line.removeprefix("RUN ")
+        for line in background.splitlines()
+        if line.startswith("RUN ") and "facebookresearch/sam2.git" in line
+    )
+    tokens = shlex.split(sam2_install)
+
+    assert (
+        "git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4"
+    ) in tokens
+    assert "SAM2_BUILD_CUDA=0" in tokens
+    assert "--no-build-isolation" in tokens
+
+
 def test_generation_install_handles_pep_668_and_keeps_ideogram_pinned() -> None:
     dockerfiles = list(ROOT.glob("Dockerfile*"))
     generation = (ROOT / "Dockerfile.generation").read_text().replace("\\\n", " ")
