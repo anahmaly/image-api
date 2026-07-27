@@ -190,7 +190,9 @@ def fuse_sam2_guidance(
     )
     if boundary_dilate:
         kernel = boundary_dilate * 2 + 1
-        support = support.filter(ImageFilter.MaxFilter(kernel)).filter(ImageFilter.MinFilter(kernel))
+        support = support.filter(ImageFilter.MaxFilter(kernel)).filter(
+            ImageFilter.MinFilter(kernel)
+        )
     sure_foreground = _fill_enclosed_holes(support)
     if interior_erode:
         sure_foreground = sure_foreground.filter(ImageFilter.MinFilter(interior_erode * 2 + 1))

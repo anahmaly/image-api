@@ -61,7 +61,9 @@ def test_guidance_fusion_is_pixelwise_monotonic_for_fragmented_sam_support() -> 
     assert fused.getpixel((2, 0))[:3] == (9, 8, 7)
 
 
-def test_guidance_fills_hole_wider_than_closing_diameter_without_filling_border_background() -> None:
+def test_guidance_fills_hole_wider_than_closing_diameter_without_filling_border_background() -> (
+    None
+):
     source = Image.new("RGB", (15, 15), (9, 8, 7))
     provisional = Image.new("L", (15, 15), 0)
     sam_mask = Image.new("L", (15, 15), 0)
@@ -179,7 +181,9 @@ def test_local_adapter_selects_best_full_resolution_logits_as_probabilities(monk
     assert probability.getpixel((0, 0)) == pytest.approx(0.5)
 
 
-def test_guided_postprocessing_preserves_provisional_foreground_outside_sam_support(monkeypatch) -> None:
+def test_guided_postprocessing_preserves_provisional_foreground_outside_sam_support(
+    monkeypatch,
+) -> None:
     from test_background_worker_adapter import _install_pr7_fakes
 
     calls: list[tuple[str, dict[str, object]]] = []
