@@ -269,16 +269,14 @@ class GenerationRunner:
                     except WorkerUnavailable as exc:
                         if self.store.requeue_pre_inference(task.task_id, self.worker_id):
                             logger.error(
-                                "generation peer eviction unavailable before inference: task_id=%s",
-                                task.task_id,
+                                "generation peer eviction unavailable before inference: capability=generation",
                                 exc_info=(type(exc), exc, exc.__traceback__),
                             )
                             raise PreInferencePeerEvictionRequeued(
                                 "peer model eviction unavailable before inference"
                             ) from exc
                         logger.error(
-                            "generation peer eviction requeue refused: task_id=%s",
-                            task.task_id,
+                            "generation peer eviction requeue refused: capability=generation",
                             exc_info=(type(exc), exc, exc.__traceback__),
                         )
                         return True

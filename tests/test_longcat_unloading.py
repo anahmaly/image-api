@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import threading
+import traceback
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -309,6 +311,89 @@ def test_generation_control_loop_uses_error_backoff_after_safe_peer_requeue() ->
     )
     assert runner.calls == 2
     assert stop.waits == [7, 3]
+
+
+def test_peer_failure_logs_and_exception_chains_exclude_configured_url_secrets(
+    caplog, tmp_path
+) -> None:
+    username = "peer-user-sentinel"
+    password = "peer-password-sentinel"
+    query = "peer-query-sentinel"
+    peer_url = f"http://{username}:{password}@upscale-worker:9001?token={query}"
+    sentinels = (username, password, query, peer_url)
+    raw_transport_message = f"reset {peer_url} user={username} password={password} query={query}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, request=request, text="peer-body-sentinel")
+
+    def assert_safe_chain(
+        exc: BaseException, expected_category: str, expected_status: str | None = None
+    ) -> None:
+        formatted = "".join(traceback.format_exception(exc))
+        linked: list[BaseException] = []
+        current: BaseException | None = exc
+        while current is not None:
+            linked.append(current)
+            current = current.__cause__ or current.__context__
+        text = formatted + "\n" + "\n".join(str(item) for item in linked)
+        assert all(sentinel not in text for sentinel in sentinels)
+        assert expected_category in text
+        if expected_status is not None:
+            assert expected_status in text
+
+    transport = httpx.MockTransport(handler)
+    workers = HttpWorkerClient(
+        peer_url,
+        "http://background-worker:9002",
+        timeout_seconds=1,
+        max_output_bytes=1000,
+        transport=transport,
+        generation_url="http://generation-worker:9003",
+    )
+    caplog.set_level(logging.ERROR)
+    assert workers.health()["upscale"]["ready"] is False
+    assert workers.unload_all()["upscale"] == {"unloaded": False, "error": "worker_unavailable"}
+    with pytest.raises(WorkerUnavailable) as request_failure:
+        workers.upscale(b"input", outscale=2)
+    assert_safe_chain(request_failure.value, "http_status", "status=503")
+
+    peer_evictor = PeerEvictor(
+        (peer_url,), client_factory=lambda _: create_internal_http_client(1, transport)
+    )
+    with pytest.raises(WorkerUnavailable) as eviction_failure:
+        peer_evictor()
+    assert_safe_chain(eviction_failure.value, "http_status", "status=503")
+
+    def transport_handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError(raw_transport_message)
+
+    transport_peer_evictor = PeerEvictor(
+        (peer_url,),
+        client_factory=lambda _: create_internal_http_client(
+            1, httpx.MockTransport(transport_handler)
+        ),
+    )
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    store.admit("safe-peer-log", {"width": 256, "height": 256, "seed": 1})
+    with pytest.raises(PreInferencePeerEvictionRequeued) as requeue_failure:
+        GenerationRunner(
+            store,
+            GpuLane(tmp_path / "gpu.lock"),
+            tmp_path / "out",
+            lambda _request: pytest.fail("model must not run"),
+            peer_evictor=transport_peer_evictor,
+        ).run_one()
+    assert_safe_chain(requeue_failure.value, "transport")
+
+    captured = caplog.text
+    assert "capability=upscale" in captured
+    assert "peer_index=0" in captured
+    assert "capability=generation" in captured
+    assert "http_status" in captured
+    assert "status=503" in captured
+    assert "transport" in captured
+    assert all(sentinel not in captured for sentinel in sentinels)
+    assert "peer-body-sentinel" not in captured
 
 
 def test_explicit_unload_is_lane_serialized_and_clears_bounded_health(tmp_path) -> None:

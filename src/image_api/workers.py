@@ -18,6 +18,49 @@ class WorkerUnavailable(RuntimeError):
     pass
 
 
+class SanitizedPeerFailure(RuntimeError):
+    """A bounded peer failure suitable for exception-object logging and propagation."""
+
+    def __init__(self, category: str, status_code: int | None = None) -> None:
+        self.category = category
+        self.status_code = status_code
+        detail = f"peer {category} failure"
+        if status_code is not None:
+            detail += f" status={status_code}"
+        super().__init__(detail)
+
+
+def _sanitize_peer_failure(exc: Exception) -> SanitizedPeerFailure:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        return SanitizedPeerFailure(
+            "http_status", status_code if 100 <= status_code <= 599 else None
+        )
+    if isinstance(exc, httpx.HTTPError):
+        return SanitizedPeerFailure("transport")
+    if isinstance(exc, WorkerUnavailable):
+        return SanitizedPeerFailure("worker_unavailable")
+    return SanitizedPeerFailure("unexpected")
+
+
+def _log_sanitized_peer_failure(message: str, failure: SanitizedPeerFailure, *args: object) -> None:
+    """Log a fresh safe traceback after the raw peer exception's scope has ended."""
+    try:
+        raise failure from None
+    except SanitizedPeerFailure as safe_failure:
+        logger.error(
+            message, *args, exc_info=(type(safe_failure), safe_failure, safe_failure.__traceback__)
+        )
+
+
+def _raise_worker_unavailable(message: str, failure: SanitizedPeerFailure) -> None:
+    """Raise with a safe exception chain and no raw HTTP/client exception context."""
+    try:
+        raise failure from None
+    except SanitizedPeerFailure as safe_failure:
+        raise WorkerUnavailable(message) from safe_failure
+
+
 def create_internal_http_client(
     timeout: httpx.Timeout | float,
     transport: httpx.BaseTransport | None = None,
@@ -59,7 +102,8 @@ class HttpWorkerClient:
         self.max_output_bytes = max_output_bytes
         self.client = create_internal_http_client(httpx.Timeout(timeout_seconds), transport)
 
-    def _get_health(self, base: str) -> dict[str, object]:
+    def _get_health(self, capability: str, base: str) -> dict[str, object]:
+        failure: SanitizedPeerFailure | None = None
         try:
             response = self.client.get(f"{base}/health", timeout=0.25)
             response.raise_for_status()
@@ -96,35 +140,35 @@ class HttpWorkerClient:
                 }
             return result
         except Exception as exc:
-            logger.warning(
-                "worker health check failed: worker_url=%s",
-                base,
-                exc_info=(type(exc), exc, exc.__traceback__),
+            failure = _sanitize_peer_failure(exc)
+        if failure is not None:
+            _log_sanitized_peer_failure(
+                "worker health check failed: capability=%s", failure, capability
             )
-            return {"ready": False, "loaded": False, "device": "unavailable"}
+        return {"ready": False, "loaded": False, "device": "unavailable"}
 
     def health(self) -> dict[str, dict[str, object]]:
-        return {name: self._get_health(url) for name, url in self.urls.items()}
+        return {name: self._get_health(name, url) for name, url in self.urls.items()}
 
     def unload_all(self) -> dict[str, dict[str, object]]:
         results: dict[str, dict[str, object]] = {}
         for name, base in self.urls.items():
+            failure: SanitizedPeerFailure | None = None
             try:
                 response = self.client.post(f"{base}/internal/unload")
                 response.raise_for_status()
                 body = response.json()
                 results[name] = {"unloaded": bool(body.get("unloaded", False))}
             except Exception as exc:
-                logger.error(
-                    "worker unload failed: worker=%s",
-                    name,
-                    exc_info=(type(exc), exc, exc.__traceback__),
-                )
+                failure = _sanitize_peer_failure(exc)
+            if failure is not None:
+                _log_sanitized_peer_failure("worker unload failed: capability=%s", failure, name)
                 results[name] = {"unloaded": False, "error": "worker_unavailable"}
         return results
 
     def _post(self, url: str, data: WorkerInput, parameters: dict[str, object]) -> IO[bytes]:
         output: IO[bytes] | None = None
+        failure: SanitizedPeerFailure | None = None
         try:
             if not isinstance(data, bytes):
                 data.seek(0)
@@ -153,7 +197,10 @@ class HttpWorkerClient:
         except Exception as exc:
             if output is not None:
                 output.close()
-            raise WorkerUnavailable("worker request failed") from exc
+            failure = _sanitize_peer_failure(exc)
+        if failure is not None:
+            _raise_worker_unavailable("worker request failed", failure)
+        raise AssertionError("worker request unexpectedly completed without output")
 
     def upscale(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
         return self._post(f"{self.upscale_url}/internal/upscale", data, parameters)
@@ -178,7 +225,8 @@ class PeerEvictor:
         )
 
     def __call__(self) -> None:
-        for peer in self.peer_urls:
+        for peer_index, peer in enumerate(self.peer_urls):
+            failure: SanitizedPeerFailure | None = None
             try:
                 with self.client_factory(self.timeout_seconds) as client:
                     response = client.post(f"{peer}/internal/unload")
@@ -186,12 +234,12 @@ class PeerEvictor:
                     if response.json().get("unloaded") is not True:
                         raise ValueError("peer did not confirm unload")
             except Exception as exc:
-                logger.error(
-                    "peer model eviction failed: peer_url=%s",
-                    peer,
-                    exc_info=(type(exc), exc, exc.__traceback__),
+                failure = _sanitize_peer_failure(exc)
+            if failure is not None:
+                _log_sanitized_peer_failure(
+                    "peer model eviction failed: peer_index=%s", failure, peer_index
                 )
-                raise WorkerUnavailable("peer model eviction failed") from exc
+                _raise_worker_unavailable("peer model eviction failed", failure)
 
 
 class FakeWorkerClient:
