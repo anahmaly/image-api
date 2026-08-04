@@ -169,7 +169,9 @@ def test_cross_process_peer_eviction_is_inside_lane_and_before_model_load(tmp_pa
     assert events == ["evict", "model"]
 
 
-def test_peer_eviction_reset_requeues_same_task_before_inference_then_replays_once(tmp_path) -> None:
+def test_peer_eviction_reset_requeues_same_task_before_inference_then_replays_once(
+    tmp_path,
+) -> None:
     store = TaskStore(tmp_path / "tasks.sqlite3")
     task = store.admit("peer-fail", {"width": 256, "height": 256, "seed": 1})
     calls = 0
@@ -221,12 +223,17 @@ def test_peer_eviction_reset_requeues_same_task_before_inference_then_replays_on
         "upscale-unloaded",
         "background-unload-attempted",
     ]
-    assert restarted.admit("peer-fail", {"width": 256, "height": 256, "seed": 1}).task_id == task.task_id
+    assert (
+        restarted.admit("peer-fail", {"width": 256, "height": 256, "seed": 1}).task_id
+        == task.task_id
+    )
     assert recovered.run_one() is False
     assert calls == 1
 
 
-def test_internal_peer_clients_ignore_ambient_proxy_for_health_unload_and_eviction(monkeypatch) -> None:
+def test_internal_peer_clients_ignore_ambient_proxy_for_health_unload_and_eviction(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("HTTP_PROXY", "http://ambient-proxy.invalid:8080")
     monkeypatch.setenv("HTTPS_PROXY", "http://ambient-proxy.invalid:8080")
     observed: list[tuple[str, str]] = []
