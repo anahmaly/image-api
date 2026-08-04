@@ -17,7 +17,7 @@ from image_api.generation import (
 )
 from image_api.images import ImageInfo, validate_image, validate_png_output
 from image_api.lane import GpuLane
-from image_api.store import TaskRecord, TaskStore
+from image_api.store import TaskKind, TaskRecord, TaskStore
 
 logger = logging.getLogger(__name__)
 ProcessingCapability = Literal["upscale", "background-removal"]
@@ -35,7 +35,7 @@ class ProcessingLoopRunner(Protocol):
 
 def run_processing_loop(
     runner: ProcessingLoopRunner,
-    capability: ProcessingCapability,
+    capability: TaskKind,
     *,
     poll_seconds: float,
     error_backoff_seconds: float,

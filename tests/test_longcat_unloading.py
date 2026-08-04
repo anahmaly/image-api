@@ -1,22 +1,32 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import threading
+import traceback
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
 from helpers import png
 from image_api.app import create_app
 from image_api.config import Settings, longcat_weights_available
-from image_api.generation import GenerationRunner
+from image_api.generation import GenerationRunner, PreInferencePeerEvictionRequeued
 from image_api.lane import GpuLane
+from image_api.processing import run_processing_loop
 from image_api.store import TaskStore
-from image_api.workers import FakeWorkerClient, HttpWorkerClient, WorkerUnavailable
+from image_api.workers import (
+    FakeWorkerClient,
+    HttpWorkerClient,
+    PeerEvictor,
+    WorkerUnavailable,
+    create_internal_http_client,
+)
 from image_api_workers.generation_models import GenerationModels, LongCatImageEditModel
 
 
@@ -161,25 +171,229 @@ def test_cross_process_peer_eviction_is_inside_lane_and_before_model_load(tmp_pa
     assert events == ["evict", "model"]
 
 
-def test_peer_eviction_failure_fails_closed_before_inference(tmp_path) -> None:
+def test_peer_eviction_reset_requeues_same_task_before_inference_then_replays_once(
+    tmp_path,
+) -> None:
     store = TaskStore(tmp_path / "tasks.sqlite3")
     task = store.admit("peer-fail", {"width": 256, "height": 256, "seed": 1})
-    called = False
+    calls = 0
+    evictions: list[str] = []
+    eviction_attempts = 0
 
     def model(_request: dict[str, object]) -> bytes:
-        nonlocal called
-        called = True
+        nonlocal calls
+        calls += 1
         return png("RGB", (256, 256))
 
-    def fail() -> None:
-        raise WorkerUnavailable("private peer detail")
+    def evict() -> None:
+        nonlocal eviction_attempts
+        eviction_attempts += 1
+        evictions.append("upscale-unloaded")
+        evictions.append("background-unload-attempted")
+        if eviction_attempts == 1:
+            raise WorkerUnavailable("peer reset")
 
     runner = GenerationRunner(
-        store, GpuLane(tmp_path / "gpu.lock"), tmp_path / "out", model, peer_evictor=fail
+        store,
+        GpuLane(tmp_path / "gpu.lock"),
+        tmp_path / "out",
+        model,
+        worker_id="generation-owner",
+        peer_evictor=evict,
     )
-    assert runner.run_one()
-    assert called is False
-    assert store.get(task.task_id).status == "failed"
+    with pytest.raises(PreInferencePeerEvictionRequeued):
+        runner.run_one()
+    assert store.get(task.task_id).status == "queued"
+    assert calls == 0
+    assert not list((tmp_path / "out").glob("*"))
+
+    restarted = TaskStore(tmp_path / "tasks.sqlite3")
+    recovered = GenerationRunner(
+        restarted,
+        GpuLane(tmp_path / "gpu.lock"),
+        tmp_path / "out",
+        model,
+        worker_id="recovered-generation-owner",
+        peer_evictor=evict,
+    )
+    assert recovered.run_one() is True
+    assert restarted.get(task.task_id).status == "succeeded"
+    assert calls == 1
+    assert evictions == [
+        "upscale-unloaded",
+        "background-unload-attempted",
+        "upscale-unloaded",
+        "background-unload-attempted",
+    ]
+    assert (
+        restarted.admit("peer-fail", {"width": 256, "height": 256, "seed": 1}).task_id
+        == task.task_id
+    )
+    assert recovered.run_one() is False
+    assert calls == 1
+
+
+def test_internal_peer_clients_ignore_ambient_proxy_for_health_unload_and_eviction(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://ambient-proxy.invalid:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://ambient-proxy.invalid:8080")
+    observed: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append((request.method, request.url.path))
+        return httpx.Response(200, json={"ready": True, "loaded": False, "unloaded": True})
+
+    original_client = httpx.Client
+    trust_env_values: list[bool] = []
+
+    def spy_client(*args, **kwargs):
+        trust_env_values.append(kwargs["trust_env"])
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", spy_client)
+    transport = httpx.MockTransport(handler)
+    workers = HttpWorkerClient(
+        "http://upscale-worker",
+        "http://background-worker",
+        timeout_seconds=1,
+        max_output_bytes=1000,
+        transport=transport,
+        generation_url="http://generation-worker",
+    )
+    assert workers.health()["upscale"]["ready"] is True
+    assert workers.unload_all()["generation"]["unloaded"] is True
+    PeerEvictor(
+        ("http://upscale-worker",),
+        client_factory=lambda _: create_internal_http_client(1, transport),
+    )()
+    assert trust_env_values == [False, False]
+    assert observed == [
+        ("GET", "/health"),
+        ("GET", "/health"),
+        ("GET", "/health"),
+        ("POST", "/internal/unload"),
+        ("POST", "/internal/unload"),
+        ("POST", "/internal/unload"),
+        ("POST", "/internal/unload"),
+    ]
+
+
+def test_generation_control_loop_uses_error_backoff_after_safe_peer_requeue() -> None:
+    class Stop:
+        def __init__(self) -> None:
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            return len(self.waits) == 2
+
+        def wait(self, seconds: float) -> None:
+            self.waits.append(seconds)
+
+    class Runner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_one(self) -> bool:
+            self.calls += 1
+            if self.calls == 1:
+                raise PreInferencePeerEvictionRequeued("requeued")
+            return False
+
+    stop = Stop()
+    runner = Runner()
+    run_processing_loop(
+        runner,
+        "generation",
+        poll_seconds=3,
+        error_backoff_seconds=7,
+        stop=stop,  # type: ignore[arg-type]
+    )
+    assert runner.calls == 2
+    assert stop.waits == [7, 3]
+
+
+def test_peer_failure_logs_and_exception_chains_exclude_configured_url_secrets(
+    caplog, tmp_path
+) -> None:
+    username = "peer-user-sentinel"
+    password = "peer-password-sentinel"
+    query = "peer-query-sentinel"
+    peer_url = f"http://{username}:{password}@upscale-worker:9001?token={query}"
+    sentinels = (username, password, query, peer_url)
+    raw_transport_message = f"reset {peer_url} user={username} password={password} query={query}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, request=request, text="peer-body-sentinel")
+
+    def assert_safe_chain(
+        exc: BaseException, expected_category: str, expected_status: str | None = None
+    ) -> None:
+        formatted = "".join(traceback.format_exception(exc))
+        linked: list[BaseException] = []
+        current: BaseException | None = exc
+        while current is not None:
+            linked.append(current)
+            current = current.__cause__ or current.__context__
+        text = formatted + "\n" + "\n".join(str(item) for item in linked)
+        assert all(sentinel not in text for sentinel in sentinels)
+        assert expected_category in text
+        if expected_status is not None:
+            assert expected_status in text
+
+    transport = httpx.MockTransport(handler)
+    workers = HttpWorkerClient(
+        peer_url,
+        "http://background-worker:9002",
+        timeout_seconds=1,
+        max_output_bytes=1000,
+        transport=transport,
+        generation_url="http://generation-worker:9003",
+    )
+    caplog.set_level(logging.ERROR)
+    assert workers.health()["upscale"]["ready"] is False
+    assert workers.unload_all()["upscale"] == {"unloaded": False, "error": "worker_unavailable"}
+    with pytest.raises(WorkerUnavailable) as request_failure:
+        workers.upscale(b"input", outscale=2)
+    assert_safe_chain(request_failure.value, "http_status", "status=503")
+
+    peer_evictor = PeerEvictor(
+        (peer_url,), client_factory=lambda _: create_internal_http_client(1, transport)
+    )
+    with pytest.raises(WorkerUnavailable) as eviction_failure:
+        peer_evictor()
+    assert_safe_chain(eviction_failure.value, "http_status", "status=503")
+
+    def transport_handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError(raw_transport_message)
+
+    transport_peer_evictor = PeerEvictor(
+        (peer_url,),
+        client_factory=lambda _: create_internal_http_client(
+            1, httpx.MockTransport(transport_handler)
+        ),
+    )
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    store.admit("safe-peer-log", {"width": 256, "height": 256, "seed": 1})
+    with pytest.raises(PreInferencePeerEvictionRequeued) as requeue_failure:
+        GenerationRunner(
+            store,
+            GpuLane(tmp_path / "gpu.lock"),
+            tmp_path / "out",
+            lambda _request: pytest.fail("model must not run"),
+            peer_evictor=transport_peer_evictor,
+        ).run_one()
+    assert_safe_chain(requeue_failure.value, "transport")
+
+    captured = caplog.text
+    assert "capability=upscale" in captured
+    assert "peer_index=0" in captured
+    assert "capability=generation" in captured
+    assert "http_status" in captured
+    assert "status=503" in captured
+    assert "transport" in captured
+    assert all(sentinel not in captured for sentinel in sentinels)
+    assert "peer-body-sentinel" not in captured
 
 
 def test_explicit_unload_is_lane_serialized_and_clears_bounded_health(tmp_path) -> None:

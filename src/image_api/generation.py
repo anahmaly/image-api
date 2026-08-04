@@ -16,6 +16,7 @@ import fcntl
 from image_api.images import validate_png_output
 from image_api.lane import GpuLane
 from image_api.store import TaskStore
+from image_api.workers import WorkerUnavailable
 
 logger = logging.getLogger(__name__)
 GenerationModel = Callable[[dict[str, object]], bytes]
@@ -28,6 +29,10 @@ SOURCE_TEMP_PATTERN = re.compile(
     r"(?:\.[0-9a-f]{64}-[0-9a-f]{64}\.png\.[0-9a-f]{32}|\.processing-upload\.[0-9a-f]{32})\.tmp"
 )
 SOURCE_LOCK_NAME = ".source-files.lock"
+
+
+class PreInferencePeerEvictionRequeued(RuntimeError):
+    """Signals the control loop to back off after a safe durable peer-eviction retry."""
 
 
 def _expected_output(request: dict[str, object]) -> tuple[int, int]:
@@ -259,7 +264,22 @@ class GenerationRunner:
         try:
             with self.lane.acquire("generation"):
                 if self.peer_evictor is not None:
-                    self.peer_evictor()
+                    try:
+                        self.peer_evictor()
+                    except WorkerUnavailable as exc:
+                        if self.store.requeue_pre_inference(task.task_id, self.worker_id):
+                            logger.error(
+                                "generation peer eviction unavailable before inference: capability=generation",
+                                exc_info=(type(exc), exc, exc.__traceback__),
+                            )
+                            raise PreInferencePeerEvictionRequeued(
+                                "peer model eviction unavailable before inference"
+                            ) from exc
+                        logger.error(
+                            "generation peer eviction requeue refused: capability=generation",
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
+                        return True
                 encoded = self.model(task.request)
             expected = _expected_output(task.request)
             validate_png_output(
@@ -287,6 +307,8 @@ class GenerationRunner:
                 temporary.unlink(missing_ok=True)
             self.store.succeed(task.task_id, image_name)
             _cleanup_task_source(self.store, task.task_id, self.source_dir)
+        except PreInferencePeerEvictionRequeued:
+            raise
         except Exception:
             logger.exception("generation task failed")
             try:

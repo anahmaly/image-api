@@ -31,6 +31,8 @@ services:
       IMAGE_API_UPSCALE_WORKER_URL: http://upscale-worker:9001
       IMAGE_API_BACKGROUND_WORKER_URL: http://background-worker:9002
       IMAGE_API_GENERATION_WORKER_URL: http://generation-worker:9003
+      NO_PROXY: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
+      no_proxy: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
       IMAGE_API_IDEOGRAM_WEIGHTS_PATH: /models/ideogram-4-nf4
       IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH: /models/longcat-image-edit
       IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH: /models/longcat-image-edit-turbo
@@ -116,6 +118,8 @@ services:
       IMAGE_API_PROCESSING_MAX_NATIVE_BYTES: ${IMAGE_API_PROCESSING_MAX_NATIVE_BYTES:-3221225472}
       IMAGE_API_BACKGROUND_WORKER_URL: http://background-worker:9002
       IMAGE_API_GENERATION_WORKER_URL: http://generation-worker:9003
+      NO_PROXY: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
+      no_proxy: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
     volumes:
       - ${IMAGE_API_UPSCALE_WEIGHTS_HOST_PATH:-./models/upscale}:/models/upscale:ro
       - image-api-state:/state
@@ -166,6 +170,8 @@ services:
       IMAGE_API_PROCESSING_MAX_NATIVE_BYTES: ${IMAGE_API_PROCESSING_MAX_NATIVE_BYTES:-3221225472}
       IMAGE_API_UPSCALE_WORKER_URL: http://upscale-worker:9001
       IMAGE_API_GENERATION_WORKER_URL: http://generation-worker:9003
+      NO_PROXY: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
+      no_proxy: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
     volumes:
       - ${IMAGE_API_BRIA_WEIGHTS_HOST_PATH:-./models/bria-rmbg-2.0}:/models/bria-rmbg-2.0:ro
       - ${IMAGE_API_BIREFNET_WEIGHTS_HOST_PATH:-./models/birefnet-hr}:/models/birefnet-hr:ro
@@ -205,6 +211,8 @@ services:
       IMAGE_API_LONGCAT_EDIT_TURBO_REVISION: 6a7262de5549f0bf0ec54c08ef7d283ef41f3214
       IMAGE_API_UPSCALE_WORKER_URL: http://upscale-worker:9001
       IMAGE_API_BACKGROUND_WORKER_URL: http://background-worker:9002
+      NO_PROXY: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
+      no_proxy: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
       IMAGE_API_CUDA_AVAILABLE: "true"
       IMAGE_API_MAX_QUEUE_DEPTH: ${IMAGE_API_MAX_QUEUE_DEPTH:-100}
       IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES: ${IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES:-300000000}

@@ -342,6 +342,22 @@ class TaskStore:
     def fail(self, task_id: str, error_code: str) -> None:
         self._transition(task_id, "failed", error_code=error_code[:64])
 
+    def requeue_pre_inference(self, task_id: str, worker_id: str) -> bool:
+        """Release only this worker's active claim before inference has started."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """UPDATE generation_tasks
+                   SET status='queued',worker_id=NULL,error_code=NULL,updated_at=?
+                   WHERE task_id=? AND status='running' AND worker_id=?""",
+                (time.time_ns(), task_id, worker_id),
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                return False
+            connection.commit()
+            return True
+
     def _transition(
         self,
         task_id: str,

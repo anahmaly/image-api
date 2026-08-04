@@ -239,6 +239,23 @@ def test_failed_processing_task_releases_reservation(tmp_path: Path) -> None:
     assert store.processing_output_bytes_used() == 6
 
 
+def test_pre_inference_requeue_requires_the_exact_active_worker_claim(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    task = store.admit("requeue-owner", {"width": 256, "height": 256})
+    first_claim = store.claim_next("owner-a")
+    assert first_claim is not None and first_claim.task_id == task.task_id
+    assert store.requeue_pre_inference(task.task_id, "owner-b") is False
+    assert store.get(task.task_id).status == "running"
+    assert store.requeue_pre_inference(task.task_id, "owner-a") is True
+    assert store.get(task.task_id).status == "queued"
+    assert store.requeue_pre_inference(task.task_id, "owner-a") is False
+    second_claim = store.claim_next("owner-c")
+    assert second_claim is not None and second_claim.task_id == task.task_id
+    store.fail(task.task_id, "terminal")
+    assert store.requeue_pre_inference(task.task_id, "owner-c") is False
+    assert store.get(task.task_id).status == "failed"
+
+
 def test_generation_tasks_are_excluded_from_processing_quota(tmp_path: Path) -> None:
     store = quota_store(tmp_path, quota=6, ceiling=6)
     store.admit("processing", processing_request(), "upscale")
