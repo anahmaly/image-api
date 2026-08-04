@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from io import BytesIO
 from tempfile import SpooledTemporaryFile
-from typing import IO, Protocol, TypeAlias
+from typing import Callable, IO, Protocol, TypeAlias
 
 import httpx
 from PIL import Image
@@ -16,6 +16,14 @@ OUTPUT_SPOOL_MEMORY_BYTES = 8 * 1024 * 1024
 
 class WorkerUnavailable(RuntimeError):
     pass
+
+
+def create_internal_http_client(
+    timeout: httpx.Timeout | float,
+    transport: httpx.BaseTransport | None = None,
+) -> httpx.Client:
+    """Create a client for Docker-internal peer traffic without ambient proxy authority."""
+    return httpx.Client(timeout=timeout, transport=transport, trust_env=False)
 
 
 class WorkerClient(Protocol):
@@ -49,7 +57,7 @@ class HttpWorkerClient:
         self.upscale_url = self.urls["upscale"]
         self.background_url = self.urls["background-removal"]
         self.max_output_bytes = max_output_bytes
-        self.client = httpx.Client(timeout=httpx.Timeout(timeout_seconds), transport=transport)
+        self.client = create_internal_http_client(httpx.Timeout(timeout_seconds), transport)
 
     def _get_health(self, base: str) -> dict[str, object]:
         try:
@@ -157,20 +165,26 @@ class HttpWorkerClient:
 class PeerEvictor:
     """Call private peer unload controls while the caller already owns the global lane."""
 
-    def __init__(self, peer_urls: tuple[str, ...], timeout_seconds: float = 30.0) -> None:
+    def __init__(
+        self,
+        peer_urls: tuple[str, ...],
+        timeout_seconds: float = 30.0,
+        client_factory: Callable[[float], httpx.Client] | None = None,
+    ) -> None:
         self.peer_urls = tuple(url.rstrip("/") for url in peer_urls)
         self.timeout_seconds = timeout_seconds
+        self.client_factory = client_factory or (
+            lambda timeout: create_internal_http_client(httpx.Timeout(timeout))
+        )
 
     def __call__(self) -> None:
         for peer in self.peer_urls:
             try:
-                response = httpx.post(
-                    f"{peer}/internal/unload",
-                    timeout=self.timeout_seconds,
-                )
-                response.raise_for_status()
-                if response.json().get("unloaded") is not True:
-                    raise ValueError("peer did not confirm unload")
+                with self.client_factory(self.timeout_seconds) as client:
+                    response = client.post(f"{peer}/internal/unload")
+                    response.raise_for_status()
+                    if response.json().get("unloaded") is not True:
+                        raise ValueError("peer did not confirm unload")
             except Exception as exc:
                 logger.error(
                     "peer model eviction failed: peer_url=%s",

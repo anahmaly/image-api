@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shlex
 from pathlib import Path
 
@@ -57,6 +58,17 @@ def test_compose_has_no_legacy_background_model_mount_contract() -> None:
     assert "IMAGE_API_REMBG_MODELS_PATH" not in compose
     assert "IMAGE_API_REMBG_WEIGHTS_PATH" not in compose
     assert "IMAGE_API_REMBG_WEIGHTS_HOST_PATH" not in compose
+
+
+def test_compose_excludes_all_internal_peers_from_ambient_proxies() -> None:
+    compose = (ROOT / "compose.yml").read_text()
+    exclusions = "localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker"
+    for service in ("image-api", "upscale-worker", "background-worker", "generation-worker"):
+        match = re.search(rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  \S|\Z)", compose)
+        assert match is not None
+        body = match.group("body")
+        assert f"NO_PROXY: {exclusions}" in body
+        assert f"no_proxy: {exclusions}" in body
 
 
 def test_pinned_upstream_sources_and_no_weight_download_commands() -> None:

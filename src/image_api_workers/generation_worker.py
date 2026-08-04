@@ -4,13 +4,13 @@ import atexit
 import logging
 import os
 import threading
-import time
 
 from fastapi import FastAPI, HTTPException
 
 from image_api.config import Settings, ideogram_weights_available, longcat_weights_available
 from image_api.generation import GenerationRunner, recover_interrupted_tasks, start_worker_heartbeat
 from image_api.lane import GpuLane
+from image_api.processing import run_processing_loop
 from image_api.store import TaskStore
 from image_api.workers import PeerEvictor
 from image_api_workers.generation_models import GenerationModels, LongCatImageEditModel
@@ -145,9 +145,13 @@ def main() -> None:
         source_dir=settings.source_dir,
     )
     poll = float(os.getenv("IMAGE_API_GENERATION_POLL_SECONDS", "0.5"))
-    while True:
-        if not runner.run_one():
-            time.sleep(poll)
+    backoff = float(os.getenv("IMAGE_API_GENERATION_ERROR_BACKOFF_SECONDS", "1.0"))
+    run_processing_loop(
+        runner,
+        "generation",
+        poll_seconds=poll,
+        error_backoff_seconds=backoff,
+    )
 
 
 if __name__ == "__main__":

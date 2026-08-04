@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 from io import BytesIO
 from pathlib import Path
 
@@ -12,6 +11,7 @@ from PIL import Image
 from image_api.config import Settings
 from image_api.generation import GenerationRunner, recover_interrupted_tasks, start_worker_heartbeat
 from image_api.lane import GpuLane
+from image_api.processing import run_processing_loop
 from image_api.store import TaskStore
 
 app = FastAPI(title="image-api-test-generation-worker", docs_url=None, redoc_url=None)
@@ -69,9 +69,7 @@ def main() -> None:
         fake_model,
         source_dir=state / "sources",
     )
-    while True:
-        if not runner.run_one():
-            time.sleep(0.1)
+    run_processing_loop(runner, "generation", poll_seconds=0.1, error_backoff_seconds=1.0)
 
 
 if __name__ == "__main__":
