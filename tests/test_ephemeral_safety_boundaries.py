@@ -419,6 +419,140 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
     assert dispatches == []
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("ready", "true"),
+        ("loaded", 1),
+        ("weightsAvailable", ["available"]),
+        ("models.ideogram-4-nf4.weightsAvailable", {}),
+        ("models.ideogram-4-nf4.loaded", "false"),
+        ("models.longcat-image-edit.weightsAvailable", 1),
+        ("models.longcat-image-edit.loaded", ["loaded"]),
+        ("models.longcat-image-edit-turbo.weightsAvailable", "true"),
+        ("models.longcat-image-edit-turbo.loaded", {}),
+    ),
+)
+def test_http_worker_health_accepts_only_literal_json_booleans(field: str, value: object) -> None:
+    body: dict[str, object] = {
+        "ready": True,
+        "loaded": True,
+        "weightsAvailable": True,
+        "device": "cpu-test",
+        "models": {
+            "ideogram-4-nf4": {"weightsAvailable": True, "loaded": True},
+            "longcat-image-edit": {"weightsAvailable": True, "loaded": True},
+            "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": True},
+        },
+    }
+    target: dict[str, object] = body
+    *parents, leaf = field.split(".")
+    for parent in parents:
+        target = cast(dict[str, object], target[parent])
+    target[leaf] = value
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body, request=request)
+
+    health = HttpWorkerClient(
+        "http://upscale", "http://background", 1, 1_000_000, httpx.MockTransport(transport)
+    ).health()["generation"]
+    expected = field.split(".")[-1]
+    if field.startswith("models."):
+        model = field.split(".")[1]
+        models = cast(dict[str, dict[str, object]], health["models"])
+        assert models[model][expected] is False
+    else:
+        assert health[expected] is False
+
+
+@pytest.mark.parametrize(
+    ("schema_case", "selected_model"),
+    (
+        ("top-ready", "ideogram-4-nf4"),
+        ("top-weights", "ideogram-4-nf4"),
+        ("ideogram-weights", "ideogram-4-nf4"),
+        ("standard-weights", "longcat-image-edit"),
+        ("turbo-weights", "longcat-image-edit-turbo"),
+        ("missing-standard", "longcat-image-edit"),
+        ("unknown-extra", "ideogram-4-nf4"),
+    ),
+)
+def test_malformed_worker_health_json_degrades_gateway_and_blocks_dispatch(
+    tmp_path, schema_case: str, selected_model: str
+) -> None:
+    health: dict[str, object] = {
+        "ready": True,
+        "loaded": False,
+        "weightsAvailable": True,
+        "device": "cpu-test",
+        "models": {
+            "ideogram-4-nf4": {"weightsAvailable": True, "loaded": False},
+            "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
+            "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
+        },
+    }
+    models = cast(dict[str, dict[str, object]], health["models"])
+    if schema_case == "top-ready":
+        health["ready"] = "true"
+    elif schema_case == "top-weights":
+        health["weightsAvailable"] = ["available"]
+    elif schema_case == "ideogram-weights":
+        models["ideogram-4-nf4"]["weightsAvailable"] = "true"
+    elif schema_case == "standard-weights":
+        models["longcat-image-edit"]["weightsAvailable"] = 1
+    elif schema_case == "turbo-weights":
+        models["longcat-image-edit-turbo"]["weightsAvailable"] = {}
+    elif schema_case == "missing-standard":
+        del models["longcat-image-edit"]
+    else:
+        del models["ideogram-4-nf4"]
+        models["unknown-model"] = {"weightsAvailable": True, "loaded": True}
+    dispatches: list[str] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "generation" and request.url.path == "/health":
+            return httpx.Response(200, json=health, request=request)
+        if request.url.host == "generation":
+            dispatches.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={"ready": True, "loaded": False, "device": "cpu-test"},
+            request=request,
+        )
+
+    workers = HttpWorkerClient(
+        "http://upscale",
+        "http://background",
+        1,
+        1_000_000,
+        httpx.MockTransport(transport),
+        "http://generation",
+    )
+    gateway = TestClient(create_app(settings=Settings.for_tests(tmp_path), workers=workers))
+    assert gateway.get("/health").json()["status"] == "degraded"
+    if selected_model == "ideogram-4-nf4":
+        response = gateway.post(
+            "/v1/generations",
+            json={
+                "width": 256,
+                "height": 256,
+                "seed": 1,
+                "sampler_preset": "V4_TURBO_12",
+                "structured_caption": {"description": "generation"},
+            },
+        )
+    else:
+        response = gateway.post(
+            "/v1/image-edits",
+            files={"file": ("input.png", png(), "image/png")},
+            data={"model": selected_model, "prompt": "edit", "seed": "1"},
+        )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "worker_unavailable"
+    assert dispatches == []
+
+
 def test_http_worker_phases_keep_only_connection_refusal_retryable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, request=request)

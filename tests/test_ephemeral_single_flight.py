@@ -190,6 +190,7 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
                 json={
                     "ready": True,
                     "loaded": False,
+                    "weightsAvailable": True,
                     "device": "cpu-test",
                     "models": {
                         "ideogram-4-nf4": {"weightsAvailable": True},
@@ -367,6 +368,7 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
                 json={
                     "ready": True,
                     "loaded": False,
+                    "weightsAvailable": True,
                     "device": "cpu-test",
                     "models": {
                         "ideogram-4-nf4": {"weightsAvailable": True},

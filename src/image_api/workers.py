@@ -87,6 +87,10 @@ class WorkerClient(Protocol):
     def unload_all(self) -> dict[str, dict[str, object]]: ...
 
 
+def _literal_json_true(value: object) -> bool:
+    return type(value) is bool and value is True
+
+
 class HttpWorkerClient:
     model_invocations = 0
     model_loads = 0
@@ -121,8 +125,8 @@ class HttpWorkerClient:
                 raw_device if raw_device in {"cuda", "cpu-test", "unavailable"} else "unavailable"
             )
             result: dict[str, object] = {
-                "ready": bool(body.get("ready")),
-                "loaded": bool(body.get("loaded")),
+                "ready": _literal_json_true(body.get("ready")),
+                "loaded": _literal_json_true(body.get("loaded")),
                 "device": device,
                 "workerReachable": True,
             }
@@ -130,7 +134,7 @@ class HttpWorkerClient:
             if isinstance(loaded_model, str):
                 result["loadedModel"] = loaded_model
             if "weightsAvailable" in body:
-                result["weightsAvailable"] = bool(body["weightsAvailable"])
+                result["weightsAvailable"] = _literal_json_true(body["weightsAvailable"])
             models = body.get("models")
             if isinstance(models, dict):
                 allowed_models = {
@@ -140,8 +144,8 @@ class HttpWorkerClient:
                 }
                 result["models"] = {
                     name: {
-                        "weightsAvailable": bool(value.get("weightsAvailable", False)),
-                        "loaded": bool(value.get("loaded", False)),
+                        "weightsAvailable": _literal_json_true(value.get("weightsAvailable")),
+                        "loaded": _literal_json_true(value.get("loaded")),
                     }
                     for name, value in models.items()
                     if name in allowed_models and isinstance(value, dict)

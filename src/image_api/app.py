@@ -151,16 +151,21 @@ def _generation_status(status: dict[str, object]) -> dict[str, object]:
     required_models = ("ideogram-4-nf4", *LONGCAT_MODELS)
     raw_models = status.get("models")
     model_weights = {
-        model: bool(raw_models.get(model, {}).get("weightsAvailable"))
+        model: type(raw_models.get(model, {}).get("weightsAvailable")) is bool
+        and raw_models.get(model, {}).get("weightsAvailable") is True
         if isinstance(raw_models, dict) and isinstance(raw_models.get(model), dict)
         else False
         for model in required_models
     }
-    weights = all(model_weights.values())
-    ready = bool(status.get("ready")) and weights
+    weights = (
+        type(status.get("weightsAvailable")) is bool
+        and status.get("weightsAvailable") is True
+        and all(model_weights.values())
+    )
+    ready = type(status.get("ready")) is bool and status.get("ready") is True and weights
     return {
         "ready": ready,
-        "loaded": bool(status.get("loaded")),
+        "loaded": type(status.get("loaded")) is bool and status.get("loaded") is True,
         "device": status.get("device", "unavailable"),
         "weightsAvailable": weights,
         "models": {
