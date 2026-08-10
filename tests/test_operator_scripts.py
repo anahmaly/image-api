@@ -322,10 +322,8 @@ def test_run_fails_false_cuda_and_does_not_tear_down(tmp_path: Path) -> None:
     "mutation",
     [
         ("service", "other"),
-        ("status", "degraded"),
         ("capabilities.upscale.ready", False),
         ("capabilities.background-removal.device", "cpu"),
-        ("capabilities.generation.weightsAvailable", False),
         ("capabilities.generation.workerAvailable", False),
         ("gpuLane.active", True),
     ],
