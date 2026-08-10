@@ -119,7 +119,6 @@ def test_health_is_not_ready_when_a_remaining_mount_is_absent(
 def test_pr7_backends_dispatch_with_bounded_options_and_rgba(
     monkeypatch, tmp_path, model: str, expected: str, query: str
 ) -> None:
-    monkeypatch.setenv("IMAGE_API_STATE_DIR", str(tmp_path))
     calls: list[tuple[str, dict[str, object]]] = []
     _install_pr7_fakes(monkeypatch, calls)
     client = TestClient(app)
@@ -144,7 +143,6 @@ def test_pr7_backends_dispatch_with_bounded_options_and_rgba(
 
 
 def test_switching_remaining_models_releases_resident_model(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("IMAGE_API_STATE_DIR", str(tmp_path))
     calls: list[tuple[str, dict[str, object]]] = []
     _install_pr7_fakes(monkeypatch, calls)
     client = TestClient(app)

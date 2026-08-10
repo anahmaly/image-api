@@ -76,6 +76,8 @@ class WorkerClient(Protocol):
     def health(self) -> dict[str, dict[str, object]]: ...
     def upscale(self, data: WorkerInput, **parameters: object) -> WorkerOutput: ...
     def background(self, data: WorkerInput, **parameters: object) -> WorkerOutput: ...
+    def generation(self, request: dict[str, object]) -> WorkerOutput: ...
+    def image_edit(self, data: WorkerInput, **parameters: object) -> WorkerOutput: ...
     def unload_all(self) -> dict[str, dict[str, object]]: ...
 
 
@@ -208,6 +210,18 @@ class HttpWorkerClient:
     def background(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
         return self._post(f"{self.background_url}/internal/background-removal", data, parameters)
 
+    def generation(self, request: dict[str, object]) -> WorkerOutput:
+        try:
+            response = self.client.post(f"{self.urls['generation']}/internal/generate", json=request)
+            response.raise_for_status()
+            return response.content
+        except Exception as exc:
+            _raise_worker_unavailable("generation worker request failed", _sanitize_peer_failure(exc))
+        raise AssertionError("unreachable")
+
+    def image_edit(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
+        return self._post(f"{self.urls['generation']}/internal/image-edit", data, parameters)
+
 
 class PeerEvictor:
     """Call private peer unload controls while the caller already owns the global lane."""
@@ -306,4 +320,19 @@ class FakeWorkerClient:
         image = self._open(data).convert("RGBA")
         output = BytesIO()
         image.save(output, "PNG")
+        return output.getvalue()
+
+    def generation(self, request: dict[str, object]) -> WorkerOutput:
+        self.model_invocations += 1
+        width, height = request.get("width"), request.get("height")
+        if type(width) is not int or type(height) is not int:
+            raise WorkerUnavailable("invalid generation request")
+        output = BytesIO()
+        Image.new("RGB", (width, height), (20, 30, 40)).save(output, "PNG")
+        return output.getvalue()
+
+    def image_edit(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
+        self.model_invocations += 1
+        output = BytesIO()
+        self._open(data).convert("RGB").save(output, "PNG")
         return output.getvalue()

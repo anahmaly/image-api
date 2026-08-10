@@ -4,6 +4,6 @@
 .ruff_cache/
 __pycache__/
 *.py[cod]
-state/
+
 models/
 .env

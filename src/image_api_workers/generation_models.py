@@ -127,12 +127,13 @@ class LongCatImageEditModel:
         with self._lock:
             model = request.get("model")
             source_name = request.get("source_image_name")
+            source_bytes = request.get("source_image_bytes")
             prompt = request.get("prompt")
             negative_prompt = request.get("negative_prompt", "")
             seed = request.get("seed")
             if model not in LONGCAT_MODELS:
                 raise ValueError("invalid persisted image-edit model")
-            if (
+            if not isinstance(source_bytes, bytes) and (
                 not isinstance(source_name, str)
                 or Path(source_name).name != source_name
                 or not source_name.endswith(".png")
@@ -145,16 +146,21 @@ class LongCatImageEditModel:
             if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
                 raise ValueError("invalid persisted image-edit seed")
             try:
-                with Image.open(self.source_dir / source_name) as opened:
+                source_input = (
+                    BytesIO(source_bytes)
+                    if isinstance(source_bytes, bytes)
+                    else self.source_dir / str(source_name)
+                )
+                with Image.open(source_input) as opened:
                     opened.load()
-                    source = opened.convert("RGB")
+                    source_image = opened.convert("RGB")
             except (OSError, ValueError):
                 raise LongCatRuntimeUnavailable("persisted source image is unavailable") from None
             pipeline = self._load(model)
             defaults = OFFICIAL_DEFAULTS[model]
             try:
                 result = pipeline(
-                    source,
+                    source_image,
                     prompt,
                     negative_prompt=negative_prompt,
                     guidance_scale=defaults["guidance_scale"],

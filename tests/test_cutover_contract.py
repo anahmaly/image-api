@@ -52,6 +52,20 @@ def test_only_gateway_publishes_ports() -> None:
     assert len(port_lines) == 1
 
 
+def test_production_has_no_durable_database_or_state_volume_path() -> None:
+    text = repository_text()
+    for forbidden in (
+        "TaskStore",
+        "tasks.sqlite",
+        "sqlite3",
+        "state-init",
+        "IMAGE_API_STATE",
+        "IMAGE_API_ENABLE_PROCESSING_RUNNER",
+        "/state",
+    ):
+        assert forbidden not in text
+
+
 def test_compose_has_no_legacy_background_model_mount_contract() -> None:
     compose = (ROOT / "compose.yml").read_text()
     assert "/models/rembg" not in compose
