@@ -26,7 +26,9 @@ The gateway is the only Compose service that publishes a host port. Worker contr
 
 The gateway separately enforces finite raw multipart-body ceilings before parsing and exact file-byte ceilings after parsing: 21 MB request / 20 MB file for normal routes, and 285 MB request / 280 MB file for processing routes. Compose exposes matching `IMAGE_API_*_REQUEST_BYTES` and `IMAGE_API_*_UPLOAD_BYTES` settings; the request allowance is bounded multipart framing, not file authority.
 
-Ideogram and LongCat readiness accepts only the configured revision/ref marker, bounded parseable required JSON/config/tokenizer inputs, non-empty bounded merge files, and either direct weights or a bounded complete shard index with lexical absolute and `..` shard names rejected. Readiness validates mounted repository inputs only; it does not download or load models.
+Ideogram and LongCat readiness accepts only the configured revision/ref marker or exact pinned snapshot directory, bounded parseable required JSON/config/tokenizer inputs, non-empty bounded merge files, and either direct weights or a bounded complete shard index with lexical absolute and `..` shard names rejected. Readiness validates mounted repository inputs only; it does not download or load models.
+
+Production Compose mounts the existing shared Hugging Face cache root once at `/models`. It resolves Ideogram through its configured repository ref and LongCat through the pinned snapshot directories below that same mount; `IMAGE_API_MODELS_HOST_PATH` defaults to `./models`.
 
 ## Development
 
