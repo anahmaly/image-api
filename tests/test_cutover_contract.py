@@ -106,23 +106,15 @@ def test_generation_compose_healthcheck_requires_responsive_worker() -> None:
     assert "['ready']" not in healthcheck
 
 
-def test_generation_compose_mounts_the_existing_shared_snapshot_root() -> None:
+def test_generation_compose_mounts_the_existing_physical_model_roots() -> None:
     compose = (ROOT / "compose.yml").read_text()
     match = re.search(r"(?ms)^  generation-worker:\n(?P<body>.*?)(?=^  \S|\Z)", compose)
     assert match is not None
     worker = match.group("body")
     assert "${IMAGE_API_MODELS_HOST_PATH:-./models}:/models:ro" in worker
-    assert "IMAGE_API_IDEOGRAM_WEIGHTS_PATH: /models" in worker
-    assert (
-        "IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH: "
-        "/models/hub/models--meituan-longcat--LongCat-Image-Edit/snapshots/"
-        "7b54ef423aa7854be7861600024be5c56ab7875a"
-    ) in worker
-    assert (
-        "IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH: "
-        "/models/hub/models--meituan-longcat--LongCat-Image-Edit-Turbo/snapshots/"
-        "6a7262de5549f0bf0ec54c08ef7d283ef41f3214"
-    ) in worker
+    assert "IMAGE_API_IDEOGRAM_WEIGHTS_PATH: /models/ideogram-4-nf4" in worker
+    assert "IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH: /models/longcat-image-edit" in worker
+    assert "IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH: /models/longcat-image-edit-turbo" in worker
 
 
 def test_gateway_compose_healthcheck_accepts_truthful_partial_gateway_readiness() -> None:
