@@ -181,10 +181,10 @@ def create_app(
     app = FastAPI(title="image-api", version="1.0.0")
     app.add_middleware(
         RequestBodyLimitMiddleware,
-        default_max_bytes=settings.max_upload_bytes,
+        default_max_bytes=settings.max_request_bytes,
         route_max_bytes={
-            "/v1/upscale": settings.processing_max_upload_bytes,
-            "/v1/background-removal": settings.processing_max_upload_bytes,
+            "/v1/upscale": settings.processing_max_request_bytes,
+            "/v1/background-removal": settings.processing_max_request_bytes,
         },
     )
 

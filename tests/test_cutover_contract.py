@@ -85,6 +85,17 @@ def test_compose_excludes_all_internal_peers_from_ambient_proxies() -> None:
         assert f"no_proxy: {exclusions}" in body
 
 
+def test_gateway_compose_keeps_finite_request_and_file_limits_distinct() -> None:
+    compose = (ROOT / "compose.yml").read_text()
+    for name, value in (
+        ("IMAGE_API_MAX_UPLOAD_BYTES", "20000000"),
+        ("IMAGE_API_MAX_REQUEST_BYTES", "21000000"),
+        ("IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES", "280000000"),
+        ("IMAGE_API_PROCESSING_MAX_REQUEST_BYTES", "285000000"),
+    ):
+        assert f"{name}: ${{{name}:-{value}}}" in compose
+
+
 def test_pinned_upstream_sources_and_no_weight_download_commands() -> None:
     text = repository_text()
     assert "dd7b6fd434cff2077ce6e9a0cab46fe254f26f1f" in text

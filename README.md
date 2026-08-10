@@ -6,7 +6,7 @@ Private-LAN gateway for isolated image workers: upscale, background removal, Ide
 
 All public image requests are synchronous and ephemeral. The single gateway process owns one in-memory `SingleFlightCoordinator`; it admits at most one execution across all capabilities and returns `503` with `Retry-After: 1` when busy. The gateway forwards one bounded internal HTTP request to the selected worker and returns the existing PNG response.
 
-No request, input, output, task, queue, or status is persisted. Restarting the gateway forgets in-flight work. A worker unavailable before inference returns retryable `503`; an interrupted or ambiguous request is never replayed by the service.
+No request, input, output, task, queue, or status is persisted. Restarting the gateway forgets in-flight work. A worker unavailable before inference returns retryable `503`; an interrupted or ambiguous request is never replayed by the service. A client disconnect does not abort a synchronous worker call: its slot remains owned until that call returns and the coordinator releases it in `finally`.
 
 `GET /health` reports `ok` only when all required internal workers are ready, and `degraded` otherwise.
 
@@ -21,6 +21,12 @@ No request, input, output, task, queue, or status is persisted. Restarting the g
 - `POST /v1/models/unload` — single-flight worker unload.
 
 The gateway is the only Compose service that publishes a host port. Worker controls are internal.
+
+## Request and snapshot bounds
+
+The gateway separately enforces finite raw multipart-body ceilings before parsing and exact file-byte ceilings after parsing: 21 MB request / 20 MB file for normal routes, and 285 MB request / 280 MB file for processing routes. Compose exposes matching `IMAGE_API_*_REQUEST_BYTES` and `IMAGE_API_*_UPLOAD_BYTES` settings; the request allowance is bounded multipart framing, not file authority.
+
+Ideogram and LongCat readiness accepts only the configured revision/ref marker, bounded parseable required JSON/config/tokenizer inputs, non-empty bounded merge files, and either direct weights or a bounded path-safe complete shard index. Readiness validates mounted repository inputs only; it does not download or load models.
 
 ## Development
 

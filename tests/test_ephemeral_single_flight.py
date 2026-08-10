@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
-from concurrent.futures import CancelledError as FutureCancelledError
 from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
 
@@ -418,17 +417,17 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
     )
     assert recovered.status_code == 200
 
-    boundary.failure = FutureCancelledError("fixture cancellation at model boundary")
-    disconnected = gateway.post(
+    boundary.failure = RuntimeError("fixture model failure after handler entry")
+    ordinary_failure = gateway.post(
         "/v1/image-edits",
         files=source,
         data={
             "model": "longcat-image-edit",
-            "prompt": "cancel",
+            "prompt": "ordinary-failure",
             "seed": "6",
         },
     )
-    assert disconnected.status_code == 502
+    assert ordinary_failure.status_code == 502
     assert coordinator.status() == {"ready": True, "active": 0, "capacity": 1}
     boundary.failure = None
     workers.client = HttpWorkerClient(
@@ -447,7 +446,7 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
                 "height": 256,
                 "seed": 8,
                 "sampler_preset": "V4_TURBO_12",
-                "structured_caption": {"description": "after-cancel"},
+                "structured_caption": {"description": "after-ordinary-failure"},
             },
         ).status_code
         == 200

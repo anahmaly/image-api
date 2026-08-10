@@ -12,15 +12,50 @@ SNAPSHOT_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 LONGCAT_EDIT_REVISION = "7b54ef423aa7854be7861600024be5c56ab7875a"
 LONGCAT_EDIT_TURBO_REVISION = "6a7262de5549f0bf0ec54c08ef7d283ef41f3214"
 SQUARE_8K_EDGE = 8192
+MAX_SNAPSHOT_MARKER_BYTES = 65
+MAX_SNAPSHOT_JSON_BYTES = 5_000_000
+MAX_SNAPSHOT_TEXT_BYTES = 1_000_000
+
+
+def _read_bounded(path: Path, maximum: int) -> bytes | None:
+    try:
+        if path.stat().st_size > maximum:
+            return None
+        with path.open("rb") as source:
+            data = source.read(maximum + 1)
+    except OSError:
+        return None
+    return data if len(data) <= maximum else None
+
+
+def _json_object_available(path: Path) -> bool:
+    data = _read_bounded(path, MAX_SNAPSHOT_JSON_BYTES)
+    if not data:
+        return False
+    try:
+        return isinstance(json.loads(data), dict)
+    except (UnicodeDecodeError, ValueError):
+        return False
+
+
+def _text_available(path: Path) -> bool:
+    data = _read_bounded(path, MAX_SNAPSHOT_TEXT_BYTES)
+    if not data:
+        return False
+    try:
+        return bool(data.decode().strip())
+    except UnicodeDecodeError:
+        return False
 
 
 def _weight_index_available(index_path: Path) -> bool:
     """Accept only bounded, local shard indexes with every referenced shard present."""
+    data = _read_bounded(index_path, MAX_SNAPSHOT_JSON_BYTES)
+    if not data:
+        return False
     try:
-        if index_path.stat().st_size > 5_000_000:
-            return False
-        document = json.loads(index_path.read_text())
-    except (OSError, ValueError):
+        document = json.loads(data)
+    except (UnicodeDecodeError, ValueError):
         return False
     weight_map = document.get("weight_map") if isinstance(document, dict) else None
     if not isinstance(weight_map, dict) or not weight_map:
@@ -47,16 +82,19 @@ def ideogram_weights_available(weights_path: Path, repository_id: str) -> bool:
     reference = (
         weights_path / "hub" / f"models--{repository_id.replace('/', '--')}" / "refs" / "main"
     )
+    reference_bytes = _read_bounded(reference, MAX_SNAPSHOT_MARKER_BYTES)
+    if reference_bytes is None:
+        return False
     try:
-        snapshot = reference.read_text().strip()
-    except OSError:
+        snapshot = reference_bytes.decode().strip()
+    except UnicodeDecodeError:
         return False
     if SNAPSHOT_PATTERN.fullmatch(snapshot) is None:
         return False
     root = reference.parent.parent / "snapshots" / snapshot
     return (
         all(
-            (root / item).is_file()
+            _json_object_available(root / item)
             for item in (
                 "vae/config.json",
                 "text_encoder/config.json",
@@ -73,11 +111,14 @@ def ideogram_weights_available(weights_path: Path, repository_id: str) -> bool:
 
 
 def longcat_weights_available(weights_path: Path, revision: str) -> bool:
-    try:
-        installed = (weights_path / ".image-api-revision").read_text().strip()
-    except OSError:
+    marker = _read_bounded(weights_path / ".image-api-revision", MAX_SNAPSHOT_MARKER_BYTES)
+    if marker is None:
         return False
-    required = (
+    try:
+        installed = marker.decode().strip()
+    except UnicodeDecodeError:
+        return False
+    required_json = (
         "config.json",
         "model_index.json",
         "scheduler/scheduler_config.json",
@@ -86,7 +127,6 @@ def longcat_weights_available(weights_path: Path, revision: str) -> bool:
         "text_encoder/preprocessor_config.json",
         "text_processor/chat_template.json",
         "text_processor/config.json",
-        "text_processor/merges.txt",
         "text_processor/preprocessor_config.json",
         "text_processor/special_tokens_map.json",
         "text_processor/tokenizer.json",
@@ -94,7 +134,6 @@ def longcat_weights_available(weights_path: Path, revision: str) -> bool:
         "text_processor/vocab.json",
         "tokenizer/chat_template.json",
         "tokenizer/config.json",
-        "tokenizer/merges.txt",
         "tokenizer/preprocessor_config.json",
         "tokenizer/tokenizer.json",
         "tokenizer/tokenizer_config.json",
@@ -104,7 +143,11 @@ def longcat_weights_available(weights_path: Path, revision: str) -> bool:
     )
     return (
         installed == revision
-        and all((weights_path / item).is_file() for item in required)
+        and all(_json_object_available(weights_path / item) for item in required_json)
+        and all(
+            _text_available(weights_path / item)
+            for item in ("text_processor/merges.txt", "tokenizer/merges.txt")
+        )
         and all(
             _weights_available(weights_path / component, filename)
             for component, filename in (
@@ -124,11 +167,13 @@ class Settings:
     longcat_edit_revision: str = LONGCAT_EDIT_REVISION
     longcat_edit_turbo_revision: str = LONGCAT_EDIT_TURBO_REVISION
     max_upload_bytes: int = 20_000_000
+    max_request_bytes: int = 21_000_000
     max_input_width: int = 10_000
     max_input_height: int = 10_000
     max_input_pixels: int = 40_000_000
     max_decoded_input_bytes: int = 160_000_000
     processing_max_upload_bytes: int = 280_000_000
+    processing_max_request_bytes: int = 285_000_000
     processing_max_encoded_output_bytes: int = 300_000_000
     processing_max_input_width: int = SQUARE_8K_EDGE
     processing_max_input_height: int = SQUARE_8K_EDGE
@@ -159,6 +204,14 @@ class Settings:
                 )
             ),
             worker_timeout_seconds=float(os.getenv("IMAGE_API_WORKER_TIMEOUT_SECONDS", "900")),
+            max_upload_bytes=int(os.getenv("IMAGE_API_MAX_UPLOAD_BYTES", "20000000")),
+            max_request_bytes=int(os.getenv("IMAGE_API_MAX_REQUEST_BYTES", "21000000")),
+            processing_max_upload_bytes=int(
+                os.getenv("IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES", "280000000")
+            ),
+            processing_max_request_bytes=int(
+                os.getenv("IMAGE_API_PROCESSING_MAX_REQUEST_BYTES", "285000000")
+            ),
             magic_prompt_backend=os.getenv("IMAGE_API_MAGIC_PROMPT_BACKEND") or None,
             generation_test_mode=os.getenv("IMAGE_API_GENERATION_TEST_MODE", "false").lower()
             == "true",
@@ -194,9 +247,11 @@ class Settings:
             longcat_edit_weights_path=root / "longcat",
             longcat_edit_turbo_weights_path=root / "longcat-turbo",
             max_upload_bytes=1_000_000,
+            max_request_bytes=1_001_000,
             max_input_pixels=1_000_000,
             max_decoded_input_bytes=4_000_000,
             processing_max_upload_bytes=1_000_000,
+            processing_max_request_bytes=1_005_000,
             processing_max_encoded_output_bytes=1_000_000,
             processing_max_input_pixels=1_000_000,
             processing_max_output_pixels=4_000_000,
