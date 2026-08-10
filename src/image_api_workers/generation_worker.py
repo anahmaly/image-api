@@ -3,16 +3,12 @@ from __future__ import annotations
 import atexit
 import logging
 import os
-import threading
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import Response
 
 from image_api.config import Settings, ideogram_weights_available, longcat_weights_available
-from image_api.generation import GenerationRunner, recover_interrupted_tasks, start_worker_heartbeat
-from image_api.lane import GpuLane
-from image_api.processing import run_processing_loop
-from image_api.store import TaskStore
-from image_api.workers import PeerEvictor
 from image_api_workers.generation_models import GenerationModels, LongCatImageEditModel
 from image_api_workers.ideogram import IdeogramModel
 
@@ -20,7 +16,7 @@ logging.basicConfig(level=os.getenv("IMAGE_API_LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 
-def create_control_app(models: GenerationModels, settings: Settings) -> FastAPI:
+def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
     app = FastAPI(title="image-api-generation-worker", docs_url=None, redoc_url=None)
 
     @app.get("/health")
@@ -28,11 +24,11 @@ def create_control_app(models: GenerationModels, settings: Settings) -> FastAPI:
         try:
             import torch
 
-            cuda_available = bool(torch.cuda.is_available())
+            cuda = bool(torch.cuda.is_available())
         except (ImportError, AttributeError, RuntimeError):
-            cuda_available = False
+            cuda = False
         repository = os.getenv("IMAGE_API_IDEOGRAM_REPOSITORY_ID", "ideogram-ai/ideogram-4-nf4")
-        mounted = {
+        mounts = {
             "ideogram-4-nf4": ideogram_weights_available(
                 settings.ideogram_weights_path, repository
             ),
@@ -40,64 +36,67 @@ def create_control_app(models: GenerationModels, settings: Settings) -> FastAPI:
                 settings.longcat_edit_weights_path, settings.longcat_edit_revision
             ),
             "longcat-image-edit-turbo": longcat_weights_available(
-                settings.longcat_edit_turbo_weights_path,
-                settings.longcat_edit_turbo_revision,
+                settings.longcat_edit_turbo_weights_path, settings.longcat_edit_turbo_revision
             ),
         }
-        result: dict[str, object] = {
-            "ready": cuda_available and any(mounted.values()),
+        return {
+            "ready": cuda and all(mounts.values()),
             "loaded": models.loaded_model is not None,
-            "device": "cuda" if cuda_available else "unavailable",
-            "weightsAvailable": all(mounted.values()),
+            "device": "cuda" if cuda else "unavailable",
+            "weightsAvailable": all(mounts.values()),
             "models": {
-                name: {"weightsAvailable": available, "loaded": models.loaded_model == name}
-                for name, available in mounted.items()
+                name: {"weightsAvailable": value, "loaded": models.loaded_model == name}
+                for name, value in mounts.items()
             },
+            "loadedModel": models.loaded_model,
         }
-        if models.loaded_model is not None:
-            result["loadedModel"] = models.loaded_model
-        return result
 
     @app.post("/internal/unload")
     def unload() -> dict[str, object]:
-        try:
-            models.unload()
-        except Exception as exc:
-            logger.error(
-                "generation worker unload failed",
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-            raise HTTPException(500, "model unload failed") from exc
+        models.unload()
         return {"unloaded": True, "loaded": False}
+
+    @app.post("/internal/generate")
+    def generate(request: dict[str, object]) -> Response:
+        try:
+            return Response(models(request), media_type="image/png")
+        except Exception as exc:
+            logger.exception("generation worker failed")
+            raise HTTPException(500, "internal generation error") from exc
+
+    @app.post("/internal/image-edit")
+    async def edit(
+        file: UploadFile = File(),
+        model: str = "",
+        prompt: str = "",
+        negative_prompt: str = "",
+        seed: int = 0,
+    ) -> Response:
+        try:
+            data = await file.read()
+            return Response(
+                models(
+                    {
+                        "model": model,
+                        "prompt": prompt,
+                        "negative_prompt": negative_prompt,
+                        "seed": seed,
+                        "source_image_bytes": data,
+                    }
+                ),
+                media_type="image/png",
+            )
+        except Exception as exc:
+            logger.exception("image edit worker failed")
+            raise HTTPException(500, "internal generation error") from exc
+        finally:
+            await file.close()
 
     return app
 
 
-def _serve_control(app: FastAPI) -> None:
-    import uvicorn
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("IMAGE_API_GENERATION_WORKER_PORT", "9003")),
-        log_level=os.getenv("IMAGE_API_LOG_LEVEL", "info").lower(),
-    )
-
-
 def main() -> None:
     settings = Settings.from_env()
-    state = settings.state_dir
-    start_worker_heartbeat(settings.generation_heartbeat_path)
-    store = TaskStore(
-        settings.database_path,
-        settings.max_queue_depth,
-        processing_max_persisted_output_bytes=settings.processing_max_persisted_output_bytes,
-        processing_max_encoded_output_bytes=settings.processing_max_encoded_output_bytes,
-        output_dir=settings.output_dir,
-    )
-    recovered = recover_interrupted_tasks(store, settings.output_dir, settings.source_dir)
-    if recovered:
-        logger.warning("Reconciled interrupted generation tasks: count=%s", recovered)
     models = GenerationModels(
         IdeogramModel(settings.ideogram_weights_path),
         LongCatImageEditModel(
@@ -105,52 +104,21 @@ def main() -> None:
                 "longcat-image-edit": settings.longcat_edit_weights_path,
                 "longcat-image-edit-turbo": settings.longcat_edit_turbo_weights_path,
             },
-            settings.source_dir,
+            Path("/tmp"),
             revisions={
                 "longcat-image-edit": settings.longcat_edit_revision,
                 "longcat-image-edit-turbo": settings.longcat_edit_turbo_revision,
             },
         ),
-        status_path=state / "generation-model-status.json",
     )
+    atexit.register(models.unload)
+    import uvicorn
 
-    def shutdown_unload() -> None:
-        try:
-            models.unload()
-        except Exception as exc:
-            logger.error(
-                "generation worker shutdown unload failed",
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-
-    atexit.register(shutdown_unload)
-    control = threading.Thread(
-        target=_serve_control,
-        args=(create_control_app(models, settings),),
-        name="generation-control",
-        daemon=True,
-    )
-    control.start()
-    runner = GenerationRunner(
-        store,
-        GpuLane(settings.gpu_lane_path, settings.lane_timeout_seconds),
-        settings.output_dir,
-        models,
-        peer_evictor=PeerEvictor(
-            (
-                os.getenv("IMAGE_API_UPSCALE_WORKER_URL", "http://upscale-worker:9001"),
-                os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
-            )
-        ),
-        source_dir=settings.source_dir,
-    )
-    poll = float(os.getenv("IMAGE_API_GENERATION_POLL_SECONDS", "0.5"))
-    backoff = float(os.getenv("IMAGE_API_GENERATION_ERROR_BACKOFF_SECONDS", "1.0"))
-    run_processing_loop(
-        runner,
-        "generation",
-        poll_seconds=poll,
-        error_backoff_seconds=backoff,
+    uvicorn.run(
+        create_worker_app(models, settings),
+        host="0.0.0.0",
+        port=int(os.getenv("IMAGE_API_GENERATION_WORKER_PORT", "9003")),
+        log_level=os.getenv("IMAGE_API_LOG_LEVEL", "info").lower(),
     )
 
 

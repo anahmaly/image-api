@@ -52,6 +52,20 @@ def test_only_gateway_publishes_ports() -> None:
     assert len(port_lines) == 1
 
 
+def test_production_has_no_durable_database_or_state_volume_path() -> None:
+    text = repository_text()
+    for forbidden in (
+        "TaskStore",
+        "tasks.sqlite",
+        "sqlite3",
+        "state-init",
+        "IMAGE_API_STATE",
+        "IMAGE_API_ENABLE_PROCESSING_RUNNER",
+        "/state",
+    ):
+        assert forbidden not in text
+
+
 def test_compose_has_no_legacy_background_model_mount_contract() -> None:
     compose = (ROOT / "compose.yml").read_text()
     assert "/models/rembg" not in compose
@@ -69,6 +83,25 @@ def test_compose_excludes_all_internal_peers_from_ambient_proxies() -> None:
         body = match.group("body")
         assert f"NO_PROXY: {exclusions}" in body
         assert f"no_proxy: {exclusions}" in body
+
+
+def test_gateway_compose_keeps_finite_request_and_file_limits_distinct() -> None:
+    compose = (ROOT / "compose.yml").read_text()
+    for name, value in (
+        ("IMAGE_API_MAX_UPLOAD_BYTES", "20000000"),
+        ("IMAGE_API_MAX_REQUEST_BYTES", "21000000"),
+        ("IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES", "280000000"),
+        ("IMAGE_API_PROCESSING_MAX_REQUEST_BYTES", "285000000"),
+    ):
+        assert f"{name}: ${{{name}:-{value}}}" in compose
+
+
+def test_generation_compose_healthcheck_requires_ready_response() -> None:
+    compose = (ROOT / "compose.yml").read_text()
+    match = re.search(r"(?ms)^  generation-worker:\n(?P<body>.*?)(?=^  \S|\Z)", compose)
+    assert match is not None
+    assert "json.load" in match.group("body")
+    assert "['ready']" in match.group("body")
 
 
 def test_pinned_upstream_sources_and_no_weight_download_commands() -> None:

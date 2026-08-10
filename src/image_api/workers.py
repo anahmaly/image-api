@@ -18,6 +18,12 @@ class WorkerUnavailable(RuntimeError):
     pass
 
 
+class WorkerExecutionFailed(RuntimeError):
+    """A worker may have entered execution; callers must not replay this result."""
+
+    pass
+
+
 class SanitizedPeerFailure(RuntimeError):
     """A bounded peer failure suitable for exception-object logging and propagation."""
 
@@ -76,7 +82,13 @@ class WorkerClient(Protocol):
     def health(self) -> dict[str, dict[str, object]]: ...
     def upscale(self, data: WorkerInput, **parameters: object) -> WorkerOutput: ...
     def background(self, data: WorkerInput, **parameters: object) -> WorkerOutput: ...
+    def generation(self, request: dict[str, object]) -> WorkerOutput: ...
+    def image_edit(self, data: WorkerInput, **parameters: object) -> WorkerOutput: ...
     def unload_all(self) -> dict[str, dict[str, object]]: ...
+
+
+def _literal_json_true(value: object) -> bool:
+    return type(value) is bool and value is True
 
 
 class HttpWorkerClient:
@@ -113,8 +125,8 @@ class HttpWorkerClient:
                 raw_device if raw_device in {"cuda", "cpu-test", "unavailable"} else "unavailable"
             )
             result: dict[str, object] = {
-                "ready": bool(body.get("ready")),
-                "loaded": bool(body.get("loaded")),
+                "ready": _literal_json_true(body.get("ready")),
+                "loaded": _literal_json_true(body.get("loaded")),
                 "device": device,
                 "workerReachable": True,
             }
@@ -122,7 +134,7 @@ class HttpWorkerClient:
             if isinstance(loaded_model, str):
                 result["loadedModel"] = loaded_model
             if "weightsAvailable" in body:
-                result["weightsAvailable"] = bool(body["weightsAvailable"])
+                result["weightsAvailable"] = _literal_json_true(body["weightsAvailable"])
             models = body.get("models")
             if isinstance(models, dict):
                 allowed_models = {
@@ -132,8 +144,8 @@ class HttpWorkerClient:
                 }
                 result["models"] = {
                     name: {
-                        "weightsAvailable": bool(value.get("weightsAvailable", False)),
-                        "loaded": bool(value.get("loaded", False)),
+                        "weightsAvailable": _literal_json_true(value.get("weightsAvailable")),
+                        "loaded": _literal_json_true(value.get("loaded")),
                     }
                     for name, value in models.items()
                     if name in allowed_models and isinstance(value, dict)
@@ -194,10 +206,18 @@ class HttpWorkerClient:
                     total += len(chunk)
                 output.seek(0)
                 return output
+        except httpx.ConnectError as exc:
+            if output is not None:
+                output.close()
+            _raise_worker_unavailable(
+                "worker connection failed before admission", _sanitize_peer_failure(exc)
+            )
         except Exception as exc:
             if output is not None:
                 output.close()
-            failure = _sanitize_peer_failure(exc)
+            raise WorkerExecutionFailed(
+                "worker execution result is unavailable"
+            ) from _sanitize_peer_failure(exc)
         if failure is not None:
             _raise_worker_unavailable("worker request failed", failure)
         raise AssertionError("worker request unexpectedly completed without output")
@@ -207,6 +227,26 @@ class HttpWorkerClient:
 
     def background(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
         return self._post(f"{self.background_url}/internal/background-removal", data, parameters)
+
+    def generation(self, request: dict[str, object]) -> WorkerOutput:
+        try:
+            response = self.client.post(
+                f"{self.urls['generation']}/internal/generate", json=request
+            )
+            response.raise_for_status()
+            return response.content
+        except httpx.ConnectError as exc:
+            _raise_worker_unavailable(
+                "generation worker connection failed before admission", _sanitize_peer_failure(exc)
+            )
+        except Exception as exc:
+            raise WorkerExecutionFailed(
+                "generation execution result is unavailable"
+            ) from _sanitize_peer_failure(exc)
+        raise AssertionError("unreachable")
+
+    def image_edit(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
+        return self._post(f"{self.urls['generation']}/internal/image-edit", data, parameters)
 
 
 class PeerEvictor:
@@ -269,6 +309,12 @@ class FakeWorkerClient:
             }
             if model is not None:
                 status["loadedModel"] = model
+            if capability == "generation":
+                status["models"] = {
+                    "ideogram-4-nf4": {"weightsAvailable": True, "loaded": False},
+                    "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
+                    "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
+                }
             result[capability] = status
         return result
 
@@ -306,4 +352,19 @@ class FakeWorkerClient:
         image = self._open(data).convert("RGBA")
         output = BytesIO()
         image.save(output, "PNG")
+        return output.getvalue()
+
+    def generation(self, request: dict[str, object]) -> WorkerOutput:
+        self.model_invocations += 1
+        width, height = request.get("width"), request.get("height")
+        if type(width) is not int or type(height) is not int:
+            raise WorkerUnavailable("invalid generation request")
+        output = BytesIO()
+        Image.new("RGB", (width, height), (20, 30, 40)).save(output, "PNG")
+        return output.getvalue()
+
+    def image_edit(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
+        self.model_invocations += 1
+        output = BytesIO()
+        self._open(data).convert("RGB").save(output, "PNG")
         return output.getvalue()

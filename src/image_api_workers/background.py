@@ -8,23 +8,14 @@ import logging
 import math
 import os
 import threading
-from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, AsyncIterator, Literal, Protocol
+from typing import Annotated, Any, Literal, Protocol
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image, ImageFilter
 
 from image_api.images import validate_dimensions
-from image_api.config import Settings
-from image_api.lane import GpuLane
-from image_api.processing import (
-    ProcessingRunner,
-    recover_processing_tasks,
-    start_processing_runner,
-)
-from image_api.store import TaskStore
 from image_api.workers import PeerEvictor
 from image_api_workers.execution import execute_in_gpu_lane
 from image_api_workers.uploads import read_bounded_upload
@@ -425,155 +416,7 @@ def _shutdown_unload() -> None:
 atexit.register(_shutdown_unload)
 
 
-def start_durable_runner() -> bool:
-    if os.getenv("IMAGE_API_ENABLE_PROCESSING_RUNNER", "false").lower() != "true":
-        return False
-
-    def build_runner() -> ProcessingRunner:
-        settings = Settings.from_env()
-        store = TaskStore(
-            settings.database_path,
-            settings.max_queue_depth,
-            processing_max_persisted_output_bytes=settings.processing_max_persisted_output_bytes,
-            processing_max_encoded_output_bytes=settings.processing_max_encoded_output_bytes,
-            output_dir=settings.output_dir,
-        )
-        recovered = recover_processing_tasks(
-            "background-removal", store, settings.output_dir, settings.source_dir, settings
-        )
-        if recovered:
-            logger.warning("reconciled interrupted background tasks: count=%s", recovered)
-
-        def model(source: Path, request: dict[str, object]) -> bytes:
-            with source.open("rb") as handle:
-                data = handle.read(settings.processing_max_upload_bytes + 1)
-            if len(data) > settings.processing_max_upload_bytes:
-                raise ValueError("persisted source exceeds configured limit")
-            model_name = request.get("model")
-            alpha_blur = request.get("alpha_blur")
-            alpha_erode = request.get("alpha_erode")
-            alpha_dilate = request.get("alpha_dilate")
-            alpha_threshold = request.get("alpha_threshold")
-            inference_size = request.get("birefnet_inference_size")
-            refinement = request.get("birefnet_foreground_refinement")
-            model_input_size = request.get("model_input_size")
-            despill_enabled = request.get("despill_enabled")
-            despill_color = request.get("despill_color")
-            despill_hex_color = request.get("despill_hex_color")
-            sam2_guidance = request.get("sam2_guidance", False)
-            sam2_model = request.get("sam2_model", "sam2.1-hiera-large")
-            sam2_mask_threshold = request.get("sam2_mask_threshold", 0.5)
-            sam2_prompt_alpha_threshold = request.get("sam2_prompt_alpha_threshold", 128)
-            sam2_interior_erode = request.get("sam2_interior_erode", 4)
-            sam2_boundary_dilate = request.get("sam2_boundary_dilate", 8)
-            boundary_alpha_gamma = request.get("boundary_alpha_gamma", 0.6)
-            if (
-                model_name not in {"bria-rmbg-2.0", "birefnet-hr-matting"}
-                or not isinstance(model_name, str)
-                or not isinstance(alpha_blur, (int, float))
-                or isinstance(alpha_blur, bool)
-                or any(
-                    type(value) is not int
-                    for value in (
-                        alpha_erode,
-                        alpha_dilate,
-                        alpha_threshold,
-                        inference_size,
-                        model_input_size,
-                    )
-                )
-                or type(refinement) is not bool
-                or type(despill_enabled) is not bool
-                or despill_color not in {"black", "white", "green", "blue", "custom"}
-                or not isinstance(despill_color, str)
-                or not isinstance(despill_hex_color, str)
-                or type(sam2_guidance) is not bool
-                or sam2_model != "sam2.1-hiera-large"
-                or not isinstance(sam2_model, str)
-                or not isinstance(sam2_mask_threshold, (int, float))
-                or isinstance(sam2_mask_threshold, bool)
-                or not 0 <= float(sam2_mask_threshold) <= 1
-                or not math.isfinite(float(sam2_mask_threshold))
-                or type(sam2_prompt_alpha_threshold) is not int
-                or not 1 <= sam2_prompt_alpha_threshold <= 255
-                or type(sam2_interior_erode) is not int
-                or not 0 <= sam2_interior_erode <= 64
-                or type(sam2_boundary_dilate) is not int
-                or not 0 <= sam2_boundary_dilate <= 64
-                or not isinstance(boundary_alpha_gamma, (int, float))
-                or isinstance(boundary_alpha_gamma, bool)
-                or not 0.1 <= float(boundary_alpha_gamma) <= 4
-                or not math.isfinite(float(boundary_alpha_gamma))
-            ):
-                raise ValueError("invalid persisted background-removal parameters")
-            assert type(alpha_erode) is int
-            assert type(alpha_dilate) is int
-            assert type(alpha_threshold) is int
-            assert type(inference_size) is int
-            assert type(model_input_size) is int
-            assert type(refinement) is bool
-            assert type(despill_enabled) is bool
-            assert type(sam2_guidance) is bool
-            assert isinstance(sam2_model, str)
-            assert type(sam2_prompt_alpha_threshold) is int
-            assert type(sam2_interior_erode) is int
-            assert type(sam2_boundary_dilate) is int
-            with _model_lock:
-                return _run_background(
-                    data,
-                    model=model_name,
-                    alpha_blur=float(alpha_blur),
-                    alpha_erode=alpha_erode,
-                    alpha_dilate=alpha_dilate,
-                    alpha_threshold=alpha_threshold,
-                    birefnet_inference_size=inference_size,
-                    birefnet_foreground_refinement=refinement,
-                    model_input_size=model_input_size,
-                    despill_enabled=despill_enabled,
-                    despill_color=despill_color,
-                    despill_hex_color=despill_hex_color,
-                    sam2_guidance=sam2_guidance,
-                    sam2_model=sam2_model,
-                    sam2_mask_threshold=float(sam2_mask_threshold),
-                    sam2_prompt_alpha_threshold=sam2_prompt_alpha_threshold,
-                    sam2_interior_erode=sam2_interior_erode,
-                    sam2_boundary_dilate=sam2_boundary_dilate,
-                    boundary_alpha_gamma=float(boundary_alpha_gamma),
-                )
-
-        return ProcessingRunner(
-            "background-removal",
-            store,
-            GpuLane(settings.gpu_lane_path, settings.lane_timeout_seconds),
-            settings.source_dir,
-            settings.output_dir,
-            model,
-            settings,
-            peer_evictor=PeerEvictor(
-                (
-                    os.getenv("IMAGE_API_UPSCALE_WORKER_URL", "http://upscale-worker:9001"),
-                    os.getenv("IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"),
-                )
-            ),
-        )
-
-    poll = float(os.getenv("IMAGE_API_PROCESSING_POLL_SECONDS", "0.5"))
-    backoff = float(os.getenv("IMAGE_API_PROCESSING_ERROR_BACKOFF_SECONDS", "1.0"))
-    return start_processing_runner(
-        "background-removal",
-        build_runner,
-        poll_seconds=poll,
-        error_backoff_seconds=backoff,
-    )
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    start_durable_runner()
-    yield
-
-
-app = FastAPI(title="image-api-background-worker", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="image-api-background-worker", docs_url=None, redoc_url=None)
 
 
 @app.get("/health")

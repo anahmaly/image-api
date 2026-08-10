@@ -1,18 +1,10 @@
 from __future__ import annotations
 
-import os
-import threading
 from io import BytesIO
-from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import Response
 from PIL import Image
-
-from image_api.config import Settings
-from image_api.generation import GenerationRunner, recover_interrupted_tasks, start_worker_heartbeat
-from image_api.lane import GpuLane
-from image_api.processing import run_processing_loop
-from image_api.store import TaskStore
 
 app = FastAPI(title="image-api-test-generation-worker", docs_url=None, redoc_url=None)
 
@@ -27,50 +19,22 @@ def unload() -> dict[str, object]:
     return {"unloaded": True}
 
 
-def fake_model(request: dict[str, object]) -> bytes:
-    if request.get("task_type") == "image-edit":
-        state = Path(os.getenv("IMAGE_API_STATE_DIR", "/state"))
-        with Image.open(state / "sources" / str(request["source_image_name"])) as source:
-            image = source.convert("RGB")
-    else:
-        width = request.get("width")
-        height = request.get("height")
-        if type(width) is not int or type(height) is not int:
-            raise ValueError("invalid test generation dimensions")
-        image = Image.new("RGB", (width, height), (20, 30, 40))
+@app.post("/internal/generate")
+def generate(request: dict[str, object]) -> Response:
+    width, height = request.get("width"), request.get("height")
+    if type(width) is not int or type(height) is not int:
+        return Response(status_code=422)
     output = BytesIO()
-    image.save(output, "PNG")
-    return output.getvalue()
+    Image.new("RGB", (width, height), (20, 30, 40)).save(output, "PNG")
+    return Response(output.getvalue(), media_type="image/png")
 
 
-def _serve() -> None:
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=9003, log_level="warning")
-
-
-def main() -> None:
-    settings = Settings.from_env()
-    state = settings.state_dir
-    start_worker_heartbeat(settings.generation_heartbeat_path)
-    threading.Thread(target=_serve, name="fake-generation-control", daemon=True).start()
-    store = TaskStore(
-        settings.database_path,
-        settings.max_queue_depth,
-        processing_max_persisted_output_bytes=settings.processing_max_persisted_output_bytes,
-        processing_max_encoded_output_bytes=settings.processing_max_encoded_output_bytes,
-        output_dir=settings.output_dir,
-    )
-    recover_interrupted_tasks(store, settings.output_dir, settings.source_dir)
-    runner = GenerationRunner(
-        store,
-        GpuLane(state / "gpu-lane.lock", 30),
-        state / "outputs",
-        fake_model,
-        source_dir=state / "sources",
-    )
-    run_processing_loop(runner, "generation", poll_seconds=0.1, error_backoff_seconds=1.0)
-
-
-if __name__ == "__main__":
-    main()
+@app.post("/internal/image-edit")
+async def edit(file: UploadFile = File()) -> Response:
+    try:
+        with Image.open(BytesIO(await file.read())) as source:
+            output = BytesIO()
+            source.convert("RGB").save(output, "PNG")
+        return Response(output.getvalue(), media_type="image/png")
+    finally:
+        await file.close()
