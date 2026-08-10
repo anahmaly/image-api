@@ -117,7 +117,7 @@ class HttpWorkerClient:
     def _get_health(self, capability: str, base: str) -> dict[str, object]:
         failure: SanitizedPeerFailure | None = None
         try:
-            response = self.client.get(f"{base}/health", timeout=0.25)
+            response = self.client.get(f"{base}/health")
             response.raise_for_status()
             body = response.json()
             if not isinstance(body, dict):
