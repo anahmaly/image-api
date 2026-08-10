@@ -18,6 +18,12 @@ class WorkerUnavailable(RuntimeError):
     pass
 
 
+class WorkerExecutionFailed(RuntimeError):
+    """A worker may have entered execution; callers must not replay this result."""
+
+    pass
+
+
 class SanitizedPeerFailure(RuntimeError):
     """A bounded peer failure suitable for exception-object logging and propagation."""
 
@@ -196,10 +202,18 @@ class HttpWorkerClient:
                     total += len(chunk)
                 output.seek(0)
                 return output
+        except httpx.ConnectError as exc:
+            if output is not None:
+                output.close()
+            _raise_worker_unavailable(
+                "worker connection failed before admission", _sanitize_peer_failure(exc)
+            )
         except Exception as exc:
             if output is not None:
                 output.close()
-            failure = _sanitize_peer_failure(exc)
+            raise WorkerExecutionFailed(
+                "worker execution result is unavailable"
+            ) from _sanitize_peer_failure(exc)
         if failure is not None:
             _raise_worker_unavailable("worker request failed", failure)
         raise AssertionError("worker request unexpectedly completed without output")
@@ -217,10 +231,14 @@ class HttpWorkerClient:
             )
             response.raise_for_status()
             return response.content
-        except Exception as exc:
+        except httpx.ConnectError as exc:
             _raise_worker_unavailable(
-                "generation worker request failed", _sanitize_peer_failure(exc)
+                "generation worker connection failed before admission", _sanitize_peer_failure(exc)
             )
+        except Exception as exc:
+            raise WorkerExecutionFailed(
+                "generation execution result is unavailable"
+            ) from _sanitize_peer_failure(exc)
         raise AssertionError("unreachable")
 
     def image_edit(self, data: WorkerInput, **parameters: object) -> WorkerOutput:

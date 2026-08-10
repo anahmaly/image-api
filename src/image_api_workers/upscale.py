@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 
-from image_api.images import validate_dimensions
+from image_api.images import ImageTooLarge, validate_dimensions, validate_png_output
 from image_api_workers.execution import execute_in_gpu_lane
 from image_api_workers.uploads import read_bounded_upload
 
@@ -89,11 +89,13 @@ def _release() -> None:
 atexit.register(_release)
 
 
-def _run(data: bytes, model: str, outscale: float, tile: int) -> bytes:
-    import cv2
-    import numpy as np
-    import torch
+def _effective_tile(tile: int, width: int, height: int) -> int:
+    if tile and tile % 32:
+        raise ValueError("invalid tile size")
+    return 512 if tile == 0 and max(width, height) >= 4096 else tile
 
+
+def _run(data: bytes, model: str, outscale: float, tile: int) -> bytes:
     if model not in MODELS or not 1 <= outscale <= 4 or (tile and tile % 32):
         raise ValueError("invalid upscale parameters")
     with Image.open(io.BytesIO(data)) as source:
@@ -109,10 +111,24 @@ def _run(data: bytes, model: str, outscale: float, tile: int) -> bytes:
                 os.getenv("IMAGE_API_PROCESSING_MAX_DECODED_INPUT_BYTES", "268435456")
             ),
         )
+        native_width, native_height = width * 4, height * 4
+        native_pixels = native_width * native_height
+        if (
+            native_width > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_WIDTH", "16384"))
+            or native_height > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_HEIGHT", "16384"))
+            or native_pixels > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_PIXELS", "268435456"))
+            or native_pixels * 3 * 4
+            > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_BYTES", "3221225472"))
+        ):
+            raise ImageTooLarge("Real-ESRGAN native processing dimensions exceed configured limits")
         image = source.convert("RGB")
+    import cv2
+    import numpy as np
+    import torch
+
     backend = _load_model(model)
     old = backend.tile_size
-    backend.tile_size = tile
+    backend.tile_size = _effective_tile(tile, width, height)
     try:
         with torch.inference_mode():
             result, _ = backend.enhance(np.asarray(image)[:, :, ::-1], outscale=outscale)
@@ -121,7 +137,18 @@ def _run(data: bytes, model: str, outscale: float, tile: int) -> bytes:
     ok, encoded = cv2.imencode(".png", result)
     if not ok:
         raise RuntimeError("PNG encoding failed")
-    return bytes(encoded)
+    output = bytes(encoded)
+    validate_png_output(
+        output,
+        expected_size=(round(width * outscale), round(height * outscale)),
+        required_mode="RGB",
+        max_bytes=int(os.getenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "300000000")),
+        max_pixels=int(os.getenv("IMAGE_API_PROCESSING_MAX_OUTPUT_PIXELS", "67108864")),
+        max_decoded_bytes=int(
+            os.getenv("IMAGE_API_PROCESSING_MAX_DECODED_OUTPUT_BYTES", "268435456")
+        ),
+    )
+    return output
 
 
 app = FastAPI(title="image-api-upscale-worker", docs_url=None, redoc_url=None)

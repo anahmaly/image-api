@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, replace
@@ -13,8 +14,31 @@ LONGCAT_EDIT_TURBO_REVISION = "6a7262de5549f0bf0ec54c08ef7d283ef41f3214"
 SQUARE_8K_EDGE = 8192
 
 
+def _weight_index_available(index_path: Path) -> bool:
+    """Accept only bounded, local shard indexes with every referenced shard present."""
+    try:
+        if index_path.stat().st_size > 5_000_000:
+            return False
+        document = json.loads(index_path.read_text())
+    except (OSError, ValueError):
+        return False
+    weight_map = document.get("weight_map") if isinstance(document, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        return False
+    for shard in set(weight_map.values()):
+        if not isinstance(shard, str):
+            return False
+        relative = Path(shard)
+        if not shard or relative.is_absolute() or ".." in relative.parts:
+            return False
+        if not (index_path.parent / relative).is_file():
+            return False
+    return True
+
+
 def _weights_available(directory: Path, filename: str) -> bool:
-    return (directory / filename).is_file() or (directory / f"{filename}.index.json").is_file()
+    weights = directory / filename
+    return weights.is_file() or _weight_index_available(weights.with_name(f"{filename}.index.json"))
 
 
 def ideogram_weights_available(weights_path: Path, repository_id: str) -> bool:
@@ -27,14 +51,24 @@ def ideogram_weights_available(weights_path: Path, repository_id: str) -> bool:
         snapshot = reference.read_text().strip()
     except OSError:
         return False
+    if SNAPSHOT_PATTERN.fullmatch(snapshot) is None:
+        return False
     root = reference.parent.parent / "snapshots" / snapshot
-    return SNAPSHOT_PATTERN.fullmatch(snapshot) is not None and all(
-        (root / item).is_file()
-        for item in (
-            "vae/diffusion_pytorch_model.safetensors",
-            "text_encoder/config.json",
-            "tokenizer/tokenizer.json",
+    return (
+        all(
+            (root / item).is_file()
+            for item in (
+                "vae/config.json",
+                "text_encoder/config.json",
+                "tokenizer/tokenizer_config.json",
+                "tokenizer/tokenizer.json",
+            )
         )
+        and all(
+            _weights_available(root / component, "diffusion_pytorch_model.safetensors")
+            for component in ("transformer", "unconditional_transformer", "vae")
+        )
+        and _weights_available(root / "text_encoder", "model.safetensors")
     )
 
 
@@ -43,10 +77,42 @@ def longcat_weights_available(weights_path: Path, revision: str) -> bool:
         installed = (weights_path / ".image-api-revision").read_text().strip()
     except OSError:
         return False
+    required = (
+        "config.json",
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "text_encoder/config.json",
+        "text_encoder/generation_config.json",
+        "text_encoder/preprocessor_config.json",
+        "text_processor/chat_template.json",
+        "text_processor/config.json",
+        "text_processor/merges.txt",
+        "text_processor/preprocessor_config.json",
+        "text_processor/special_tokens_map.json",
+        "text_processor/tokenizer.json",
+        "text_processor/tokenizer_config.json",
+        "text_processor/vocab.json",
+        "tokenizer/chat_template.json",
+        "tokenizer/config.json",
+        "tokenizer/merges.txt",
+        "tokenizer/preprocessor_config.json",
+        "tokenizer/tokenizer.json",
+        "tokenizer/tokenizer_config.json",
+        "tokenizer/vocab.json",
+        "transformer/config.json",
+        "vae/config.json",
+    )
     return (
         installed == revision
-        and (weights_path / "config.json").is_file()
-        and _weights_available(weights_path / "transformer", "diffusion_pytorch_model.safetensors")
+        and all((weights_path / item).is_file() for item in required)
+        and all(
+            _weights_available(weights_path / component, filename)
+            for component, filename in (
+                ("text_encoder", "model.safetensors"),
+                ("transformer", "diffusion_pytorch_model.safetensors"),
+                ("vae", "diffusion_pytorch_model.safetensors"),
+            )
+        )
     )
 
 
@@ -80,7 +146,7 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> Settings:
-        return cls(
+        settings = cls(
             ideogram_weights_path=Path(
                 os.getenv("IMAGE_API_IDEOGRAM_WEIGHTS_PATH", "/models/ideogram-4-nf4")
             ),
@@ -96,6 +162,29 @@ class Settings:
             magic_prompt_backend=os.getenv("IMAGE_API_MAGIC_PROMPT_BACKEND") or None,
             generation_test_mode=os.getenv("IMAGE_API_GENERATION_TEST_MODE", "false").lower()
             == "true",
+        )
+        return replace(
+            settings,
+            processing_max_native_width=int(
+                os.getenv(
+                    "IMAGE_API_PROCESSING_MAX_NATIVE_WIDTH", settings.processing_max_native_width
+                )
+            ),
+            processing_max_native_height=int(
+                os.getenv(
+                    "IMAGE_API_PROCESSING_MAX_NATIVE_HEIGHT", settings.processing_max_native_height
+                )
+            ),
+            processing_max_native_pixels=int(
+                os.getenv(
+                    "IMAGE_API_PROCESSING_MAX_NATIVE_PIXELS", settings.processing_max_native_pixels
+                )
+            ),
+            processing_max_native_bytes=int(
+                os.getenv(
+                    "IMAGE_API_PROCESSING_MAX_NATIVE_BYTES", settings.processing_max_native_bytes
+                )
+            ),
         )
 
     @classmethod
@@ -118,9 +207,13 @@ class Settings:
         return replace(value, **overrides)
 
     def admit_upscale_processing(self, width: int, height: int) -> tuple[int, int]:
+        native_width, native_height = width * 4, height * 4
+        native_pixels = native_width * native_height
         if (
-            width * 4 > self.processing_max_native_width
-            or height * 4 > self.processing_max_native_height
+            native_width > self.processing_max_native_width
+            or native_height > self.processing_max_native_height
+            or native_pixels > self.processing_max_native_pixels
+            or native_pixels * 3 * 4 > self.processing_max_native_bytes
         ):
             raise ValueError("Real-ESRGAN native processing dimensions exceed configured limits")
-        return width * 4, height * 4
+        return native_width, native_height
