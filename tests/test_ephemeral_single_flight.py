@@ -31,9 +31,30 @@ def test_all_direct_capabilities_return_existing_synchronous_responses(tmp_path)
     worker = FakeWorkerClient()
     client = TestClient(create_app(settings=Settings.for_tests(tmp_path), workers=worker))
     source = {"file": ("input.png", png(), "image/png")}
-    assert client.post("/v1/upscale?model=RealESRGAN_x4plus&outscale=2&tile=0", files=source).headers["content-type"].startswith("image/png")
-    assert client.post("/v1/background-removal?model=birefnet-hr-matting", files=source).headers["content-type"].startswith("image/png")
-    assert client.post("/v1/generations", json={"width": 256, "height": 256, "seed": 1, "sampler_preset": "V4_TURBO_12", "structured_caption": {"description": "bee"}}).headers["content-type"].startswith("image/png")
+    assert (
+        client.post("/v1/upscale?model=RealESRGAN_x4plus&outscale=2&tile=0", files=source)
+        .headers["content-type"]
+        .startswith("image/png")
+    )
+    assert (
+        client.post("/v1/background-removal?model=birefnet-hr-matting", files=source)
+        .headers["content-type"]
+        .startswith("image/png")
+    )
+    assert (
+        client.post(
+            "/v1/generations",
+            json={
+                "width": 256,
+                "height": 256,
+                "seed": 1,
+                "sampler_preset": "V4_TURBO_12",
+                "structured_caption": {"description": "bee"},
+            },
+        )
+        .headers["content-type"]
+        .startswith("image/png")
+    )
     assert worker.model_invocations == 3
 
 
@@ -45,7 +66,16 @@ def test_worker_unavailability_is_retryable_without_replay(tmp_path) -> None:
 
     worker = UnavailableWorker()
     client = TestClient(create_app(settings=Settings.for_tests(tmp_path), workers=worker))
-    response = client.post("/v1/generations", json={"width": 256, "height": 256, "seed": 1, "sampler_preset": "V4_TURBO_12", "structured_caption": {"description": "bee"}})
+    response = client.post(
+        "/v1/generations",
+        json={
+            "width": 256,
+            "height": 256,
+            "seed": 1,
+            "sampler_preset": "V4_TURBO_12",
+            "structured_caption": {"description": "bee"},
+        },
+    )
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "worker_unavailable"
     assert worker.model_invocations == 1

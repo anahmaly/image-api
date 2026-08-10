@@ -212,11 +212,15 @@ class HttpWorkerClient:
 
     def generation(self, request: dict[str, object]) -> WorkerOutput:
         try:
-            response = self.client.post(f"{self.urls['generation']}/internal/generate", json=request)
+            response = self.client.post(
+                f"{self.urls['generation']}/internal/generate", json=request
+            )
             response.raise_for_status()
             return response.content
         except Exception as exc:
-            _raise_worker_unavailable("generation worker request failed", _sanitize_peer_failure(exc))
+            _raise_worker_unavailable(
+                "generation worker request failed", _sanitize_peer_failure(exc)
+            )
         raise AssertionError("unreachable")
 
     def image_edit(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
