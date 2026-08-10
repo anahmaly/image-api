@@ -28,7 +28,7 @@ The gateway separately enforces finite raw multipart-body ceilings before parsin
 
 Ideogram and LongCat readiness accepts only the configured revision/ref marker or exact pinned snapshot directory, bounded parseable required JSON/config/tokenizer inputs, non-empty bounded merge files, and either direct weights or a bounded complete shard index with lexical absolute and `..` shard names rejected. Readiness validates mounted repository inputs only; it does not download or load models.
 
-Production Compose mounts the existing shared Hugging Face cache root once at `/models`. It resolves Ideogram through its configured repository ref and LongCat through the pinned snapshot directories below that same mount; `IMAGE_API_MODELS_HOST_PATH` defaults to `./models`.
+Production Compose mounts the existing model root once at `/models`. It resolves Ideogram at `/models/ideogram-4-nf4`, standard LongCat at `/models/longcat-image-edit`, and Turbo at `/models/longcat-image-edit-turbo`; `IMAGE_API_MODELS_HOST_PATH` defaults to `./models`.
 
 ## Development
 

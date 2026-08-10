@@ -162,7 +162,7 @@ def _ideogram_snapshot(root, *, sharded: bool = False):
     return snapshot
 
 
-def _longcat_snapshot(root, revision: str, *, sharded: bool = False):
+def _longcat_snapshot(root, revision: str, *, sharded: bool = False, merge_size: int | None = None):
     root.mkdir(parents=True)
     (root / ".image-api-revision").write_text(revision)
     for name in (
@@ -194,7 +194,12 @@ def _longcat_snapshot(root, revision: str, *, sharded: bool = False):
     for name in ("text_processor/merges.txt", "tokenizer/merges.txt"):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("merge")
+        if merge_size is None:
+            path.write_text("merge")
+        else:
+            path.write_text("merge")
+            with path.open("r+b") as merge_file:
+                merge_file.truncate(merge_size)
     for component, filename in (
         ("text_encoder", "model.safetensors"),
         ("transformer", "diffusion_pytorch_model.safetensors"),
@@ -218,29 +223,25 @@ def _write_json_of_size(path, size: int) -> None:
     path.write_bytes(prefix + b"x" * (size - len(prefix) - len(suffix)) + suffix)
 
 
-def test_production_composed_snapshot_mount_layout_makes_longcat_ready(
+def test_production_composed_physical_model_layout_admits_all_configured_models(
     monkeypatch, tmp_path
 ) -> None:
     models_root = tmp_path / "models"
-    _ideogram_snapshot(models_root)
+    _ideogram_snapshot(models_root / "ideogram-4-nf4")
     standard = _longcat_snapshot(
-        models_root
-        / "hub/models--meituan-longcat--LongCat-Image-Edit/snapshots"
-        / LONGCAT_EDIT_REVISION,
+        models_root / "longcat-image-edit",
         LONGCAT_EDIT_REVISION,
+        merge_size=1_671_839,
     )
     turbo = _longcat_snapshot(
-        models_root
-        / "hub/models--meituan-longcat--LongCat-Image-Edit-Turbo/snapshots"
-        / LONGCAT_EDIT_TURBO_REVISION,
+        models_root / "longcat-image-edit-turbo",
         LONGCAT_EDIT_TURBO_REVISION,
+        merge_size=1_671_839,
     )
-    (standard / ".image-api-revision").unlink()
-    (turbo / ".image-api-revision").unlink()
     settings = Settings.for_tests(
         tmp_path,
         generation_test_mode=False,
-        ideogram_weights_path=models_root,
+        ideogram_weights_path=models_root / "ideogram-4-nf4",
         longcat_edit_weights_path=standard,
         longcat_edit_turbo_weights_path=turbo,
     )
@@ -267,8 +268,15 @@ def test_production_composed_snapshot_mount_layout_makes_longcat_ready(
         .json()
     )
 
+    assert ideogram_weights_available(models_root / "ideogram-4-nf4", "ideogram-ai/ideogram-4-nf4")
+    assert longcat_weights_available(standard, LONGCAT_EDIT_REVISION)
+    assert longcat_weights_available(turbo, LONGCAT_EDIT_TURBO_REVISION)
     assert health["ready"] is True
-    assert health["models"]["longcat-image-edit"]["weightsAvailable"] is True
+    assert health["models"] == {
+        "ideogram-4-nf4": {"weightsAvailable": True, "loaded": False},
+        "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
+        "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
+    }
 
 
 def test_official_tokenizer_json_sizes_reach_generation_readiness(monkeypatch, tmp_path) -> None:
