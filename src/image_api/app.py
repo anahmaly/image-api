@@ -375,10 +375,23 @@ def create_app(
             max_pixels=settings.processing_max_input_pixels,
             max_decoded_bytes=settings.processing_max_decoded_input_bytes,
         )
-        params = locals().copy()
-        params.pop("file")
-        params.pop("data")
-        params.pop("info")
+        params = {
+            "model": model,
+            "alpha_blur": alpha_blur,
+            "alpha_erode": alpha_erode,
+            "alpha_dilate": alpha_dilate,
+            "alpha_threshold": alpha_threshold,
+            "birefnet_inference_size": birefnet_inference_size,
+            "birefnet_foreground_refinement": birefnet_foreground_refinement,
+            "model_input_size": model_input_size,
+            "sam2_guidance": sam2_guidance,
+            "sam2_model": sam2_model,
+            "sam2_mask_threshold": sam2_mask_threshold,
+            "sam2_prompt_alpha_threshold": sam2_prompt_alpha_threshold,
+            "sam2_interior_erode": sam2_interior_erode,
+            "sam2_boundary_dilate": sam2_boundary_dilate,
+            "boundary_alpha_gamma": boundary_alpha_gamma,
+        }
         encoded = _bytes(coordinator.run(lambda: workers.background(data, **params)))
         validate_png_output(
             encoded,
