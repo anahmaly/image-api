@@ -302,8 +302,13 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
         else:
             target.write_text("{")
 
+    observed_models: list[str] = []
+
     class IdeogramBoundary:
         def __call__(self, request: dict[str, object]) -> bytes:
+            model = request["model"]
+            assert isinstance(model, str)
+            observed_models.append(model)
             width = request["width"]
             height = request["height"]
             assert type(width) is int and type(height) is int
@@ -316,7 +321,10 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
         loaded_model: str | None = None
 
         def __call__(self, request: dict[str, object]) -> bytes:
-            self.loaded_model = str(request["model"])
+            model = request["model"]
+            assert isinstance(model, str)
+            self.loaded_model = model
+            observed_models.append(model)
             source = request["source_image_bytes"]
             assert isinstance(source, bytes)
             return source
@@ -366,37 +374,58 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
     gateway = TestClient(create_app(settings=settings, workers=workers))
     health = gateway.get("/health").json()
 
-    if unavailable_model is None:
-        assert health["status"] == "ok"
-        assert health["capabilities"]["generation"]["ready"] is True
-        assert (
-            gateway.post(
+    def dispatch_selected(model: str, *, seed: int) -> str:
+        observed_model_count = len(observed_models)
+        if model == "ideogram-4-nf4":
+            response = gateway.post(
                 "/v1/generations",
                 json={
                     "width": 256,
                     "height": 256,
-                    "seed": 1,
+                    "seed": seed,
                     "sampler_preset": "V4_TURBO_12",
                     "structured_caption": {"description": "generation"},
                 },
-            ).status_code
-            == 200
-        )
-        assert (
-            gateway.post(
+            )
+            expected_dispatch = "/internal/generate"
+        else:
+            response = gateway.post(
                 "/v1/image-edits",
                 files={"file": ("input.png", png(), "image/png")},
-                data={"model": "longcat-image-edit", "prompt": "edit", "seed": "1"},
-            ).status_code
-            == 200
-        )
-        assert dispatches == ["/internal/generate", "/internal/image-edit"]
+                data={"model": model, "prompt": "edit", "seed": str(seed)},
+            )
+            expected_dispatch = "/internal/image-edit"
+        assert response.status_code == 200
+        assert observed_models[observed_model_count:] == [model]
+        return expected_dispatch
+
+    if unavailable_model is None:
+        assert health["status"] == "ok"
+        assert health["capabilities"]["generation"]["ready"] is True
+        expected_dispatches = [
+            dispatch_selected(model, seed=index)
+            for index, model in enumerate(
+                ("ideogram-4-nf4", "longcat-image-edit", "longcat-image-edit-turbo"), start=1
+            )
+        ]
+        assert dispatches == expected_dispatches
         return
 
     assert health["status"] == "degraded"
     generation_health = health["capabilities"]["generation"]
     assert generation_health["ready"] is False
     assert generation_health["models"][unavailable_model]["weightsAvailable"] is False
+    available_models = tuple(
+        model
+        for model in ("ideogram-4-nf4", "longcat-image-edit", "longcat-image-edit-turbo")
+        if model != unavailable_model
+    )
+    expected_dispatches = [
+        dispatch_selected(model, seed=index)
+        for index, model in enumerate(available_models, start=1)
+    ]
+    assert dispatches == expected_dispatches
+    dispatch_count_before_rejection = len(dispatches)
     if unavailable_model == "ideogram-4-nf4":
         response = gateway.post(
             "/v1/generations",
@@ -416,7 +445,7 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
         )
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "worker_unavailable"
-    assert dispatches == []
+    assert len(dispatches) == dispatch_count_before_rejection
 
 
 @pytest.mark.parametrize(

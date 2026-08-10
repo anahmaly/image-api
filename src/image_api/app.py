@@ -163,15 +163,23 @@ def _generation_status(status: dict[str, object]) -> dict[str, object]:
         and all(model_weights.values())
     )
     ready = type(status.get("ready")) is bool and status.get("ready") is True and weights
+    worker_available = (
+        type(status.get("workerReachable")) is bool
+        and status.get("workerReachable") is True
+        and type(status.get("healthSchemaValid")) is bool
+        and status.get("healthSchemaValid") is True
+        and status.get("device") in {"cuda", "cpu-test"}
+    )
     return {
         "ready": ready,
         "loaded": type(status.get("loaded")) is bool and status.get("loaded") is True,
         "device": status.get("device", "unavailable"),
         "weightsAvailable": weights,
+        "workerAvailable": worker_available,
         "models": {
             model: {
                 "weightsAvailable": available,
-                "ready": ready and available,
+                "ready": worker_available and available,
             }
             for model, available in model_weights.items()
         },
@@ -424,7 +432,9 @@ def create_app(
     def generation(body: GenerationRequest) -> Response:
         if body.prompt is not None and settings.magic_prompt_backend is None:
             raise HTTPException(422, "plain prompt expansion is not configured")
-        if not _generation_status(workers.health().get("generation", {}))["ready"]:
+        generation = _generation_status(workers.health().get("generation", {}))
+        model_matrix = cast(dict[str, dict[str, bool]], generation["models"])
+        if not model_matrix["ideogram-4-nf4"]["ready"]:
             raise WorkerUnavailable("generation capability is unavailable")
         encoded = _bytes(
             coordinator.run(

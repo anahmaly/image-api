@@ -8,7 +8,7 @@ All public image requests are synchronous and ephemeral. The single gateway proc
 
 No request, input, output, task, queue, or status is persisted. Restarting the gateway forgets in-flight work. A worker unavailable before inference returns retryable `503`; an interrupted or ambiguous request is never replayed by the service. A client disconnect does not abort a synchronous worker call: its slot remains owned until that call returns and the coordinator releases it in `finally`.
 
-`GET /health` reports `ok` only when all required internal workers and every publicly selectable generation/edit model are ready, and `degraded` otherwise. A selected unavailable generation/edit model is rejected before its internal worker dispatch.
+`GET /health` reports `ok` only when all required internal workers and every publicly selectable generation/edit model are ready, and `degraded` otherwise. The generation worker's container health is its responsive `/health` endpoint; its payload remains the authoritative per-model availability matrix. A selected unavailable generation/edit model is rejected before its internal worker dispatch, while another ready model remains usable.
 
 ## Public API
 

@@ -120,6 +120,8 @@ class HttpWorkerClient:
             response = self.client.get(f"{base}/health", timeout=0.25)
             response.raise_for_status()
             body = response.json()
+            if not isinstance(body, dict):
+                raise ValueError("worker health response must be an object")
             raw_device = body.get("device")
             device = (
                 raw_device if raw_device in {"cuda", "cpu-test", "unavailable"} else "unavailable"
@@ -129,6 +131,11 @@ class HttpWorkerClient:
                 "loaded": _literal_json_true(body.get("loaded")),
                 "device": device,
                 "workerReachable": True,
+                "healthSchemaValid": (
+                    type(body.get("ready")) is bool
+                    and type(body.get("loaded")) is bool
+                    and ("weightsAvailable" not in body or type(body["weightsAvailable"]) is bool)
+                ),
             }
             loaded_model = body.get("loadedModel")
             if isinstance(loaded_model, str):
@@ -306,6 +313,8 @@ class FakeWorkerClient:
                 "loaded": model is not None,
                 "device": "cpu-test",
                 "weightsAvailable": True,
+                "workerReachable": True,
+                "healthSchemaValid": True,
             }
             if model is not None:
                 status["loadedModel"] = model
