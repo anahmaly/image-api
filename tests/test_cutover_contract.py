@@ -106,6 +106,16 @@ def test_generation_compose_healthcheck_requires_responsive_worker() -> None:
     assert "['ready']" not in healthcheck
 
 
+def test_gateway_compose_healthcheck_accepts_truthful_partial_gateway_readiness() -> None:
+    compose = (ROOT / "compose.yml").read_text()
+    match = re.search(r"(?ms)^  image-api:\n(?P<body>.*?)(?=^  \S|\Z)", compose)
+    assert match is not None
+    healthcheck = match.group("body")
+    assert "urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)" in healthcheck
+    assert "['service'] == 'image-api'" in healthcheck
+    assert "['status'] in ('ok', 'degraded')" in healthcheck
+
+
 def test_pinned_upstream_sources_and_no_weight_download_commands() -> None:
     text = repository_text()
     assert "dd7b6fd434cff2077ce6e9a0cab46fe254f26f1f" in text
