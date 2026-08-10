@@ -397,6 +397,29 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
     generation_health = health["capabilities"]["generation"]
     assert generation_health["ready"] is False
     assert generation_health["models"][unavailable_model]["weightsAvailable"] is False
+    available_model = next(model for model in snapshots if model != unavailable_model)
+    if available_model == "ideogram-4-nf4":
+        available_response = gateway.post(
+            "/v1/generations",
+            json={
+                "width": 256,
+                "height": 256,
+                "seed": 2,
+                "sampler_preset": "V4_TURBO_12",
+                "structured_caption": {"description": "available generation"},
+            },
+        )
+        expected_dispatch = "/internal/generate"
+    else:
+        available_response = gateway.post(
+            "/v1/image-edits",
+            files={"file": ("input.png", png(), "image/png")},
+            data={"model": available_model, "prompt": "available edit", "seed": "2"},
+        )
+        expected_dispatch = "/internal/image-edit"
+    assert available_response.status_code == 200
+    assert dispatches == [expected_dispatch]
+    dispatches.clear()
     if unavailable_model == "ideogram-4-nf4":
         response = gateway.post(
             "/v1/generations",

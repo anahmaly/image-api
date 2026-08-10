@@ -187,12 +187,12 @@ if not isinstance(payload, dict):
     raise SystemExit("gateway health validation failed: response must be a JSON object")
 if payload.get("service") != "image-api":
     raise SystemExit("gateway health validation failed: service must equal image-api")
-if payload.get("status") != "ok":
-    raise SystemExit("gateway health validation failed: status must equal ok")
+if payload.get("status") not in {"ok", "degraded"}:
+    raise SystemExit("gateway health validation failed: status must equal ok or degraded")
 capabilities = payload.get("capabilities")
 if not isinstance(capabilities, dict):
     raise SystemExit("gateway health validation failed: capabilities must be an object")
-for capability in ("upscale", "background-removal", "generation"):
+for capability in ("upscale", "background-removal"):
     details = capabilities.get(capability)
     if not isinstance(details, dict):
         raise SystemExit(f"gateway health validation failed: missing {capability} capability")
@@ -201,10 +201,12 @@ for capability in ("upscale", "background-removal", "generation"):
     if details.get("device") != "cuda":
         raise SystemExit(f"gateway health validation failed: {capability} device must equal cuda")
 generation = capabilities["generation"]
-if generation.get("weightsAvailable") is not True:
-    raise SystemExit("gateway health validation failed: generation weights are unavailable")
+if not isinstance(generation, dict):
+    raise SystemExit("gateway health validation failed: missing generation capability")
 if generation.get("workerAvailable") is not True:
     raise SystemExit("gateway health validation failed: generation worker is unavailable")
+if generation.get("device") != "cuda":
+    raise SystemExit("gateway health validation failed: generation worker device must equal cuda")
 gpu_lane = payload.get("gpuLane")
 if not isinstance(gpu_lane, dict) or gpu_lane.get("active") is not False:
     raise SystemExit("gateway health validation failed: GPU lane must be inactive")

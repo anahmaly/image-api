@@ -190,6 +190,26 @@ def test_run_starts_only_production_stack_and_verifies_every_contract(tmp_path: 
     assert not any(" down" in call for call in calls)
 
 
+def test_run_accepts_responsive_gateway_with_partial_generation_model_matrix(
+    tmp_path: Path,
+) -> None:
+    payload = _healthy_payload()
+    payload["status"] = "degraded"
+    generation = payload["capabilities"]["generation"]
+    assert isinstance(generation, dict)
+    generation["ready"] = False
+    generation["weightsAvailable"] = False
+    env, _ = _fake_environment(
+        tmp_path,
+        FAKE_HEALTH_JSON=json.dumps(payload, separators=(",", ":")),
+    )
+
+    result = _run(SCRIPTS[1], env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "Gateway health contract verified" in result.stdout
+
+
 @pytest.mark.parametrize(
     ("mapping", "expected_url"),
     [

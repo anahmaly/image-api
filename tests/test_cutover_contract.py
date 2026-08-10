@@ -96,12 +96,14 @@ def test_gateway_compose_keeps_finite_request_and_file_limits_distinct() -> None
         assert f"{name}: ${{{name}:-{value}}}" in compose
 
 
-def test_generation_compose_healthcheck_requires_ready_response() -> None:
+def test_generation_compose_healthcheck_requires_responsive_worker() -> None:
     compose = (ROOT / "compose.yml").read_text()
     match = re.search(r"(?ms)^  generation-worker:\n(?P<body>.*?)(?=^  \S|\Z)", compose)
     assert match is not None
-    assert "json.load" in match.group("body")
-    assert "['ready']" in match.group("body")
+    healthcheck = match.group("body")
+    assert "urllib.request.urlopen('http://127.0.0.1:9003/health', timeout=3)" in healthcheck
+    assert "json.load" not in healthcheck
+    assert "['ready']" not in healthcheck
 
 
 def test_pinned_upstream_sources_and_no_weight_download_commands() -> None:
