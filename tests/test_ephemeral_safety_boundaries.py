@@ -212,6 +212,53 @@ def _longcat_snapshot(root, revision: str, *, sharded: bool = False):
     return root
 
 
+def _write_json_of_size(path, size: int) -> None:
+    prefix = b'{"tokenizer":"'
+    suffix = b'"}'
+    path.write_bytes(prefix + b"x" * (size - len(prefix) - len(suffix)) + suffix)
+
+
+def test_official_tokenizer_json_sizes_reach_generation_readiness(monkeypatch, tmp_path) -> None:
+    settings = Settings.for_tests(tmp_path, generation_test_mode=False)
+    ideogram = _ideogram_snapshot(settings.ideogram_weights_path)
+    standard = _longcat_snapshot(settings.longcat_edit_weights_path, LONGCAT_EDIT_REVISION)
+    turbo = _longcat_snapshot(settings.longcat_edit_turbo_weights_path, LONGCAT_EDIT_TURBO_REVISION)
+    _write_json_of_size(ideogram / "tokenizer/tokenizer.json", 11_422_650)
+    for snapshot in (standard, turbo):
+        _write_json_of_size(snapshot / "text_processor/tokenizer.json", 7_031_645)
+        _write_json_of_size(snapshot / "tokenizer/tokenizer.json", 7_031_645)
+
+    class Adapter:
+        def __call__(self, request: dict[str, object]) -> bytes:
+            return b""
+
+        def unload(self) -> None:
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: True)),
+    )
+    health = (
+        TestClient(
+            create_worker_app(
+                GenerationModels(cast(Any, Adapter()), cast(Any, Adapter())), settings
+            )
+        )
+        .get("/health")
+        .json()
+    )
+
+    assert health["ready"] is True
+    assert health["weightsAvailable"] is True
+    assert health["models"] == {
+        "ideogram-4-nf4": {"weightsAvailable": True, "loaded": False},
+        "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
+        "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
+    }
+
+
 def test_snapshot_validation_requires_direct_or_safe_complete_shards(tmp_path) -> None:
     snapshot = _ideogram_snapshot(tmp_path, sharded=True)
     assert ideogram_weights_available(tmp_path, "ideogram-ai/ideogram-4-nf4")
@@ -234,7 +281,10 @@ def test_complete_longcat_snapshot_is_ready(tmp_path, revision: str, sharded: bo
 
 
 @pytest.mark.parametrize("snapshot", ("ideogram", "longcat"))
-@pytest.mark.parametrize("failure", ("malformed", "oversized", "missing", "unsafe-index", "marker"))
+@pytest.mark.parametrize(
+    "failure",
+    ("malformed", "oversized", "missing", "empty", "unsafe-index", "missing-shard", "marker"),
+)
 def test_snapshot_validation_rejects_malformed_or_unsafe_loader_inputs(
     tmp_path, snapshot: str, failure: str
 ) -> None:
@@ -256,8 +306,12 @@ def test_snapshot_validation_rejects_malformed_or_unsafe_loader_inputs(
         json_file.write_bytes(b"{" + b"x" * MAX_SNAPSHOT_JSON_BYTES)
     elif failure == "missing":
         json_file.unlink()
+    elif failure == "empty":
+        json_file.write_bytes(b"")
     elif failure == "unsafe-index":
         index.write_text(json.dumps({"weight_map": {"layer": "../escape.safetensors"}}))
+    elif failure == "missing-shard":
+        (index.parent / "weights-00001.safetensors").unlink()
     else:
         marker.write_text("a" * 66)
     if snapshot == "ideogram":
