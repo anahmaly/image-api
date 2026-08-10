@@ -13,9 +13,6 @@ services:
       IMAGE_API_UPSCALE_WORKER_URL: http://upscale-worker:9001
       IMAGE_API_BACKGROUND_WORKER_URL: http://background-worker:9002
       IMAGE_API_GENERATION_WORKER_URL: http://generation-worker:9003
-      IMAGE_API_IDEOGRAM_WEIGHTS_PATH: /models/ideogram-4-nf4
-      IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH: /models/longcat-image-edit
-      IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH: /models/longcat-image-edit-turbo
       IMAGE_API_WORKER_TIMEOUT_SECONDS: ${IMAGE_API_WORKER_TIMEOUT_SECONDS:-900}
       IMAGE_API_MAX_UPLOAD_BYTES: ${IMAGE_API_MAX_UPLOAD_BYTES:-20000000}
       IMAGE_API_MAX_REQUEST_BYTES: ${IMAGE_API_MAX_REQUEST_BYTES:-21000000}
@@ -27,10 +24,6 @@ services:
       IMAGE_API_PROCESSING_MAX_NATIVE_BYTES: ${IMAGE_API_PROCESSING_MAX_NATIVE_BYTES:-3221225472}
       NO_PROXY: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
       no_proxy: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
-    volumes:
-      - ${IMAGE_API_IDEOGRAM_WEIGHTS_HOST_PATH:-./models/ideogram-4-nf4}:/models/ideogram-4-nf4:ro
-      - ${IMAGE_API_LONGCAT_EDIT_WEIGHTS_HOST_PATH:-./models/longcat-image-edit}:/models/longcat-image-edit:ro
-      - ${IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_HOST_PATH:-./models/longcat-image-edit-turbo}:/models/longcat-image-edit-turbo:ro
     depends_on:
       upscale-worker:
         condition: service_healthy
@@ -95,16 +88,14 @@ services:
     user: "10001:10001"
     expose: ["9003"]
     environment:
-      IMAGE_API_IDEOGRAM_WEIGHTS_PATH: /models/ideogram-4-nf4
+      IMAGE_API_IDEOGRAM_WEIGHTS_PATH: /models
       IMAGE_API_IDEOGRAM_REPOSITORY_ID: ideogram-ai/ideogram-4-nf4
-      IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH: /models/longcat-image-edit
-      IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH: /models/longcat-image-edit-turbo
+      IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH: /models/hub/models--meituan-longcat--LongCat-Image-Edit/snapshots/7b54ef423aa7854be7861600024be5c56ab7875a
+      IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH: /models/hub/models--meituan-longcat--LongCat-Image-Edit-Turbo/snapshots/6a7262de5549f0bf0ec54c08ef7d283ef41f3214
       NO_PROXY: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
       no_proxy: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
     volumes:
-      - ${IMAGE_API_IDEOGRAM_WEIGHTS_HOST_PATH:-./models/ideogram-4-nf4}:/models/ideogram-4-nf4:ro
-      - ${IMAGE_API_LONGCAT_EDIT_WEIGHTS_HOST_PATH:-./models/longcat-image-edit}:/models/longcat-image-edit:ro
-      - ${IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_HOST_PATH:-./models/longcat-image-edit-turbo}:/models/longcat-image-edit-turbo:ro
+      - ${IMAGE_API_MODELS_HOST_PATH:-./models}:/models:ro
     gpus: all
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9003/health', timeout=3)"]

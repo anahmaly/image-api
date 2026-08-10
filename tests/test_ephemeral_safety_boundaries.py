@@ -218,6 +218,59 @@ def _write_json_of_size(path, size: int) -> None:
     path.write_bytes(prefix + b"x" * (size - len(prefix) - len(suffix)) + suffix)
 
 
+def test_production_composed_snapshot_mount_layout_makes_longcat_ready(
+    monkeypatch, tmp_path
+) -> None:
+    models_root = tmp_path / "models"
+    _ideogram_snapshot(models_root)
+    standard = _longcat_snapshot(
+        models_root
+        / "hub/models--meituan-longcat--LongCat-Image-Edit/snapshots"
+        / LONGCAT_EDIT_REVISION,
+        LONGCAT_EDIT_REVISION,
+    )
+    turbo = _longcat_snapshot(
+        models_root
+        / "hub/models--meituan-longcat--LongCat-Image-Edit-Turbo/snapshots"
+        / LONGCAT_EDIT_TURBO_REVISION,
+        LONGCAT_EDIT_TURBO_REVISION,
+    )
+    (standard / ".image-api-revision").unlink()
+    (turbo / ".image-api-revision").unlink()
+    settings = Settings.for_tests(
+        tmp_path,
+        generation_test_mode=False,
+        ideogram_weights_path=models_root,
+        longcat_edit_weights_path=standard,
+        longcat_edit_turbo_weights_path=turbo,
+    )
+
+    class Adapter:
+        def __call__(self, request: dict[str, object]) -> bytes:
+            return b""
+
+        def unload(self) -> None:
+            pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: True)),
+    )
+    health = (
+        TestClient(
+            create_worker_app(
+                GenerationModels(cast(Any, Adapter()), cast(Any, Adapter())), settings
+            )
+        )
+        .get("/health")
+        .json()
+    )
+
+    assert health["ready"] is True
+    assert health["models"]["longcat-image-edit"]["weightsAvailable"] is True
+
+
 def test_official_tokenizer_json_sizes_reach_generation_readiness(monkeypatch, tmp_path) -> None:
     settings = Settings.for_tests(tmp_path, generation_test_mode=False)
     ideogram = _ideogram_snapshot(settings.ideogram_weights_path)

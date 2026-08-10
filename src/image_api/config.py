@@ -111,13 +111,17 @@ def ideogram_weights_available(weights_path: Path, repository_id: str) -> bool:
 
 
 def longcat_weights_available(weights_path: Path, revision: str) -> bool:
-    marker = _read_bounded(weights_path / ".image-api-revision", MAX_SNAPSHOT_MARKER_BYTES)
+    marker_path = weights_path / ".image-api-revision"
+    marker = _read_bounded(marker_path, MAX_SNAPSHOT_MARKER_BYTES)
     if marker is None:
-        return False
-    try:
-        installed = marker.decode().strip()
-    except UnicodeDecodeError:
-        return False
+        if marker_path.exists():
+            return False
+        installed = weights_path.name
+    else:
+        try:
+            installed = marker.decode().strip()
+        except UnicodeDecodeError:
+            return False
     required_json = (
         "config.json",
         "model_index.json",
