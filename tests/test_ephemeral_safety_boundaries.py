@@ -302,8 +302,13 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
         else:
             target.write_text("{")
 
+    observed_models: list[str] = []
+
     class IdeogramBoundary:
         def __call__(self, request: dict[str, object]) -> bytes:
+            model = request["model"]
+            assert isinstance(model, str)
+            observed_models.append(model)
             width = request["width"]
             height = request["height"]
             assert type(width) is int and type(height) is int
@@ -316,7 +321,10 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
         loaded_model: str | None = None
 
         def __call__(self, request: dict[str, object]) -> bytes:
-            self.loaded_model = str(request["model"])
+            model = request["model"]
+            assert isinstance(model, str)
+            self.loaded_model = model
+            observed_models.append(model)
             source = request["source_image_bytes"]
             assert isinstance(source, bytes)
             return source
@@ -367,6 +375,7 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
     health = gateway.get("/health").json()
 
     def dispatch_selected(model: str, *, seed: int) -> str:
+        observed_model_count = len(observed_models)
         if model == "ideogram-4-nf4":
             response = gateway.post(
                 "/v1/generations",
@@ -387,6 +396,7 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
             )
             expected_dispatch = "/internal/image-edit"
         assert response.status_code == 200
+        assert observed_models[observed_model_count:] == [model]
         return expected_dispatch
 
     if unavailable_model is None:
