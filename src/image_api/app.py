@@ -9,7 +9,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFi
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, model_validator
 
-from image_api.config import Settings, ideogram_weights_available
+from image_api.config import Settings
 from image_api.coordinator import CoordinatorBusy, SingleFlightCoordinator
 from image_api.images import (
     ImageTooLarge,
@@ -147,17 +147,29 @@ def _bytes(output: object) -> bytes:
         stream.close()
 
 
-def _generation_status(settings: Settings, status: dict[str, object]) -> dict[str, object]:
-    repository = os.getenv("IMAGE_API_IDEOGRAM_REPOSITORY_ID", "ideogram-ai/ideogram-4-nf4")
-    weights = settings.generation_test_mode or ideogram_weights_available(
-        settings.ideogram_weights_path, repository
-    )
+def _generation_status(status: dict[str, object]) -> dict[str, object]:
+    required_models = ("ideogram-4-nf4", *LONGCAT_MODELS)
+    raw_models = status.get("models")
+    model_weights = {
+        model: bool(raw_models.get(model, {}).get("weightsAvailable"))
+        if isinstance(raw_models, dict) and isinstance(raw_models.get(model), dict)
+        else False
+        for model in required_models
+    }
+    weights = all(model_weights.values())
     ready = bool(status.get("ready")) and weights
     return {
         "ready": ready,
         "loaded": bool(status.get("loaded")),
         "device": status.get("device", "unavailable"),
         "weightsAvailable": weights,
+        "models": {
+            model: {
+                "weightsAvailable": available,
+                "ready": ready and available,
+            }
+            for model, available in model_weights.items()
+        },
     }
 
 
@@ -259,7 +271,7 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, object]:
         raw = workers.health()
-        generation = _generation_status(settings, raw.get("generation", {}))
+        generation = _generation_status(raw.get("generation", {}))
         capabilities: dict[str, dict[str, object]] = {"generation": generation}
         for name in ("upscale", "background-removal"):
             status = raw.get(name, {})
@@ -407,7 +419,7 @@ def create_app(
     def generation(body: GenerationRequest) -> Response:
         if body.prompt is not None and settings.magic_prompt_backend is None:
             raise HTTPException(422, "plain prompt expansion is not configured")
-        if not _generation_status(settings, workers.health().get("generation", {}))["ready"]:
+        if not _generation_status(workers.health().get("generation", {}))["ready"]:
             raise WorkerUnavailable("generation capability is unavailable")
         encoded = _bytes(
             coordinator.run(
@@ -433,6 +445,10 @@ def create_app(
         seed: Annotated[int, Form(ge=0, le=2**32 - 1)],
         negative_prompt: Annotated[str, Form(max_length=4000)] = "",
     ) -> Response:
+        generation = _generation_status(workers.health().get("generation", {}))
+        model_matrix = cast(dict[str, dict[str, bool]], generation["models"])
+        if not model_matrix[model]["ready"]:
+            raise WorkerUnavailable("selected image-edit model is unavailable")
         data = await _read_upload(file, settings.max_upload_bytes)
         info = validate_image(
             data,

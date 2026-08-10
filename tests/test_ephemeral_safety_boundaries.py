@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import types
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -19,6 +22,8 @@ from image_api.config import (
 )
 from image_api.workers import FakeWorkerClient, HttpWorkerClient
 from image_api_workers import upscale
+from image_api_workers.generation_models import GenerationModels
+from image_api_workers.generation_worker import create_worker_app
 
 
 @pytest.mark.parametrize(
@@ -259,6 +264,159 @@ def test_snapshot_validation_rejects_malformed_or_unsafe_loader_inputs(
         assert not ideogram_weights_available(tmp_path, "ideogram-ai/ideogram-4-nf4")
     else:
         assert not longcat_weights_available(root, LONGCAT_EDIT_REVISION)
+
+
+@pytest.mark.parametrize(
+    ("unavailable_model", "failure"),
+    (
+        (None, None),
+        ("ideogram-4-nf4", "missing"),
+        ("ideogram-4-nf4", "malformed"),
+        ("longcat-image-edit", "missing"),
+        ("longcat-image-edit", "malformed"),
+        ("longcat-image-edit-turbo", "missing"),
+        ("longcat-image-edit-turbo", "malformed"),
+    ),
+)
+def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    unavailable_model: str | None,
+    failure: str | None,
+) -> None:
+    """The actual worker health matrix is the gateway admission authority."""
+
+    settings = Settings.for_tests(tmp_path, generation_test_mode=False)
+    ideogram = _ideogram_snapshot(settings.ideogram_weights_path)
+    standard = _longcat_snapshot(settings.longcat_edit_weights_path, LONGCAT_EDIT_REVISION)
+    turbo = _longcat_snapshot(settings.longcat_edit_turbo_weights_path, LONGCAT_EDIT_TURBO_REVISION)
+    snapshots = {
+        "ideogram-4-nf4": ideogram / "vae/config.json",
+        "longcat-image-edit": standard / "config.json",
+        "longcat-image-edit-turbo": turbo / "config.json",
+    }
+    if unavailable_model is not None:
+        target = snapshots[unavailable_model]
+        if failure == "missing":
+            target.unlink()
+        else:
+            target.write_text("{")
+
+    class IdeogramBoundary:
+        def __call__(self, request: dict[str, object]) -> bytes:
+            width = request["width"]
+            height = request["height"]
+            assert type(width) is int and type(height) is int
+            return png(size=(width, height))
+
+        def unload(self) -> None:
+            pass
+
+    class LongCatBoundary:
+        loaded_model: str | None = None
+
+        def __call__(self, request: dict[str, object]) -> bytes:
+            self.loaded_model = str(request["model"])
+            source = request["source_image_bytes"]
+            assert isinstance(source, bytes)
+            return source
+
+        def unload(self) -> None:
+            self.loaded_model = None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: True)),
+    )
+    models = GenerationModels(cast(Any, IdeogramBoundary()), cast(Any, LongCatBoundary()))
+    generation = TestClient(create_worker_app(models, settings))
+    dispatches: list[str] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "generation":
+            if request.url.path != "/health":
+                dispatches.append(request.url.path)
+            response = generation.request(
+                request.method,
+                request.url.raw_path.decode(),
+                content=request.content,
+                headers={"content-type": request.headers.get("content-type", "")},
+            )
+            return httpx.Response(
+                response.status_code,
+                content=response.content,
+                headers=response.headers,
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={"ready": True, "loaded": False, "device": "cpu-test"},
+            request=request,
+        )
+
+    workers = HttpWorkerClient(
+        "http://upscale",
+        "http://background",
+        1,
+        1_000_000,
+        httpx.MockTransport(transport),
+        "http://generation",
+    )
+    gateway = TestClient(create_app(settings=settings, workers=workers))
+    health = gateway.get("/health").json()
+
+    if unavailable_model is None:
+        assert health["status"] == "ok"
+        assert health["capabilities"]["generation"]["ready"] is True
+        assert (
+            gateway.post(
+                "/v1/generations",
+                json={
+                    "width": 256,
+                    "height": 256,
+                    "seed": 1,
+                    "sampler_preset": "V4_TURBO_12",
+                    "structured_caption": {"description": "generation"},
+                },
+            ).status_code
+            == 200
+        )
+        assert (
+            gateway.post(
+                "/v1/image-edits",
+                files={"file": ("input.png", png(), "image/png")},
+                data={"model": "longcat-image-edit", "prompt": "edit", "seed": "1"},
+            ).status_code
+            == 200
+        )
+        assert dispatches == ["/internal/generate", "/internal/image-edit"]
+        return
+
+    assert health["status"] == "degraded"
+    generation_health = health["capabilities"]["generation"]
+    assert generation_health["ready"] is False
+    assert generation_health["models"][unavailable_model]["weightsAvailable"] is False
+    if unavailable_model == "ideogram-4-nf4":
+        response = gateway.post(
+            "/v1/generations",
+            json={
+                "width": 256,
+                "height": 256,
+                "seed": 1,
+                "sampler_preset": "V4_TURBO_12",
+                "structured_caption": {"description": "generation"},
+            },
+        )
+    else:
+        response = gateway.post(
+            "/v1/image-edits",
+            files={"file": ("input.png", png(), "image/png")},
+            data={"model": unavailable_model, "prompt": "edit", "seed": "1"},
+        )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "worker_unavailable"
+    assert dispatches == []
 
 
 def test_http_worker_phases_keep_only_connection_refusal_retryable() -> None:

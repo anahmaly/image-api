@@ -96,6 +96,14 @@ def test_gateway_compose_keeps_finite_request_and_file_limits_distinct() -> None
         assert f"{name}: ${{{name}:-{value}}}" in compose
 
 
+def test_generation_compose_healthcheck_requires_ready_response() -> None:
+    compose = (ROOT / "compose.yml").read_text()
+    match = re.search(r"(?ms)^  generation-worker:\n(?P<body>.*?)(?=^  \S|\Z)", compose)
+    assert match is not None
+    assert "json.load" in match.group("body")
+    assert "['ready']" in match.group("body")
+
+
 def test_pinned_upstream_sources_and_no_weight_download_commands() -> None:
     text = repository_text()
     assert "dd7b6fd434cff2077ce6e9a0cab46fe254f26f1f" in text

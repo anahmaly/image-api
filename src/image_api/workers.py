@@ -305,6 +305,12 @@ class FakeWorkerClient:
             }
             if model is not None:
                 status["loadedModel"] = model
+            if capability == "generation":
+                status["models"] = {
+                    "ideogram-4-nf4": {"weightsAvailable": True, "loaded": False},
+                    "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
+                    "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
+                }
             result[capability] = status
         return result
 

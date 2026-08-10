@@ -187,7 +187,16 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
         if request.url.path == "/health":
             return httpx.Response(
                 200,
-                json={"ready": True, "loaded": False, "device": "cpu-test"},
+                json={
+                    "ready": True,
+                    "loaded": False,
+                    "device": "cpu-test",
+                    "models": {
+                        "ideogram-4-nf4": {"weightsAvailable": True},
+                        "longcat-image-edit": {"weightsAvailable": True},
+                        "longcat-image-edit-turbo": {"weightsAvailable": True},
+                    },
+                },
                 request=request,
             )
         dispatches.append((capability, request.url.raw_path.decode(), request.content))
@@ -354,7 +363,18 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
     def connect_failure(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
             return httpx.Response(
-                200, json={"ready": True, "loaded": False, "device": "cpu-test"}, request=request
+                200,
+                json={
+                    "ready": True,
+                    "loaded": False,
+                    "device": "cpu-test",
+                    "models": {
+                        "ideogram-4-nf4": {"weightsAvailable": True},
+                        "longcat-image-edit": {"weightsAvailable": True},
+                        "longcat-image-edit-turbo": {"weightsAvailable": True},
+                    },
+                },
+                request=request,
             )
         raise httpx.ConnectError("fixture connect failure", request=request)
 

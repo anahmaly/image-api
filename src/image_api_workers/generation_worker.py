@@ -40,7 +40,7 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
             ),
         }
         return {
-            "ready": cuda and any(mounts.values()),
+            "ready": cuda and all(mounts.values()),
             "loaded": models.loaded_model is not None,
             "device": "cuda" if cuda else "unavailable",
             "weightsAvailable": all(mounts.values()),
