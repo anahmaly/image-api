@@ -261,6 +261,19 @@ def _validate_worker_dimensions(width: int, height: int, *, output: bool) -> Non
     )
 
 
+def _birefnet_output_limits() -> Any:
+    from rembg_api.limits import ImageLimits
+
+    return ImageLimits(
+        max_width=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_WIDTH", "8192")),
+        max_height=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT", "8192")),
+        max_pixels=int(os.getenv("IMAGE_API_PROCESSING_MAX_OUTPUT_PIXELS", "67108864")),
+        max_encoded_bytes=int(
+            os.getenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "300000000")
+        ),
+    )
+
+
 def _run_background(
     data: bytes,
     *,
@@ -301,6 +314,7 @@ def _run_background(
             inference_size=birefnet_inference_size,
             foreground_refinement=birefnet_foreground_refinement,
             config=_birefnet_config(),
+            output_limits=_birefnet_output_limits(),
         )
     elif model == "bria-rmbg-2.0":
         from rembg_api.bria_rmbg import remove_with_bria_rmbg_2
