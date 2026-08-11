@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import sys
+import types
 from types import SimpleNamespace
 
 from helpers import png
+from spawn_adapters import build_adapters, settings as spawn_settings
 from PIL import Image
 
-from image_api_workers.generation_models import GenerationModels, LongCatImageEditModel
+from image_api_workers.generation_models import (
+    GenerationAdapterSettings,
+    GenerationModels,
+    LongCatImageEditModel,
+)
 
 
 class EditPipeline:
@@ -82,14 +89,7 @@ def test_longcat_uses_official_defaults_and_releases_on_model_switch(tmp_path) -
 
 
 def test_generation_model_switch_unloads_longcat_before_ideogram(tmp_path) -> None:
-    events: list[object] = []
-    longcat = LongCatImageEditModel(
-        {"longcat-image-edit": tmp_path, "longcat-image-edit-turbo": tmp_path},
-        tmp_path,
-        pipeline_factory=lambda model, _path: EditPipeline(model, events),
-        cuda_available=lambda: True,
-    )
-    models = GenerationModels(FakeIdeogram(events), longcat)
+    models = GenerationModels(spawn_settings(), adapter_factory=build_adapters)
     models(
         {
             "model": "longcat-image-edit",
@@ -116,4 +116,29 @@ def test_generation_model_switch_unloads_longcat_before_ideogram(tmp_path) -> No
     assert first_child.is_alive() is False
     assert models.child_alive is True
     assert models.loaded_model == "longcat-image-edit-turbo"
+    models.unload()
+
+
+def test_generation_child_uses_spawn_after_parent_cuda_inspection(monkeypatch, tmp_path) -> None:
+    """CUDA-sensitive construction happens in a fresh spawned interpreter, not a fork clone."""
+    child_start_method = tmp_path / "child-start-method"
+    cuda = types.SimpleNamespace(is_available=lambda: True)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+    assert cuda.is_available() is True
+    models = GenerationModels(
+        GenerationAdapterSettings(str(child_start_method), (), "", ()),
+        adapter_factory=build_adapters,
+    )
+
+    assert models(
+        {
+            "model": "ideogram-4-nf4",
+            "width": 256,
+            "height": 256,
+            "seed": 1,
+            "sampler_preset": "V4_TURBO_12",
+            "structured_caption": {"description": "spawn-safe"},
+        }
+    ).startswith(b"\x89PNG")
+    assert child_start_method.read_text() == "spawn"
     models.unload()

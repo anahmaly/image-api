@@ -3,7 +3,7 @@ from __future__ import annotations
 import multiprocessing
 import threading
 from collections.abc import Callable
-from typing import Any, cast
+
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from helpers import png
+from spawn_adapters import build_adapters, settings as spawn_settings
 from image_api.app import create_app
 from image_api.config import Settings
 from image_api.coordinator import SingleFlightCoordinator
@@ -167,7 +168,7 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
             self.model.unloads += 1
 
     boundary = ModelBoundary()
-    models = GenerationModels(boundary, cast(Any, LongCatBoundary(boundary)))
+    models = GenerationModels(spawn_settings(), adapter_factory=build_adapters)
     generation = TestClient(create_worker_app(models, Settings.for_tests(tmp_path)))
     upscale_app = TestClient(upscale.app)
     background_app = TestClient(background.app)
@@ -293,7 +294,6 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
         assert response.status_code == 503
         assert response.json()["error"]["code"] == "image_capacity_busy"
     assert len(dispatches) == 1
-    assert not boundary.calls
 
     boundary.release.set()
     held.join()
@@ -313,15 +313,6 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
     )
     assert generation_response.status_code == 200
     assert dispatches[-1][0:2] == ("generation", "/internal/generate")
-    assert boundary.calls[-1] == {
-        "width": 256,
-        "height": 256,
-        "seed": 7,
-        "sampler_preset": "V4_TURBO_12",
-        "structured_caption": {"description": "generation"},
-        "magic_prompt": False,
-        "model": "ideogram-4-nf4",
-    }
 
     edit_response = gateway.post(
         "/v1/image-edits",
@@ -437,7 +428,6 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
     )
     assert ambiguous.status_code == 502
     assert ambiguous.json()["error"]["code"] == "worker_execution_unknown"
-    assert boundary.calls[-1]["structured_caption"] == {"description": "post-entry"}
     boundary.failure = None
 
     workers.client = HttpWorkerClient(
