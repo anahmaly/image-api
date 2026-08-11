@@ -4,13 +4,14 @@ import asyncio
 import json
 import sys
 import types
-from typing import Any, cast
+from typing import cast
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from helpers import png
+from spawn_adapters import build_adapters, settings as spawn_settings
 from image_api.app import RequestBodyLimitMiddleware, create_app
 from image_api.config import (
     LONGCAT_EDIT_REVISION,
@@ -261,7 +262,7 @@ def test_production_composed_physical_model_layout_admits_all_configured_models(
     health = (
         TestClient(
             create_worker_app(
-                GenerationModels(cast(Any, Adapter()), cast(Any, Adapter())), settings
+                GenerationModels(spawn_settings(), adapter_factory=build_adapters), settings
             )
         )
         .get("/health")
@@ -304,7 +305,7 @@ def test_official_tokenizer_json_sizes_reach_generation_readiness(monkeypatch, t
     health = (
         TestClient(
             create_worker_app(
-                GenerationModels(cast(Any, Adapter()), cast(Any, Adapter())), settings
+                GenerationModels(spawn_settings(), adapter_factory=build_adapters), settings
             )
         )
         .get("/health")
@@ -450,8 +451,8 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
     )
     lifecycle: list[tuple[str, str, int]] = []
     models = GenerationModels(
-        cast(Any, IdeogramBoundary()),
-        cast(Any, LongCatBoundary()),
+        spawn_settings(),
+        adapter_factory=build_adapters,
         lifecycle_observer=lambda event, model, live_children: lifecycle.append(
             (event, model, live_children)
         ),

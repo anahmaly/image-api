@@ -9,8 +9,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from image_api.config import Settings, ideogram_weights_available, longcat_weights_available
-from image_api_workers.generation_models import GenerationModels, LongCatImageEditModel
-from image_api_workers.ideogram import IdeogramModel
+from image_api_workers.generation_models import GenerationAdapterSettings, GenerationModels
 
 logging.basicConfig(level=os.getenv("IMAGE_API_LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -99,17 +98,17 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
 def main() -> None:
     settings = Settings.from_env()
     models = GenerationModels(
-        IdeogramModel(settings.ideogram_weights_path),
-        LongCatImageEditModel(
-            {
-                "longcat-image-edit": settings.longcat_edit_weights_path,
-                "longcat-image-edit-turbo": settings.longcat_edit_turbo_weights_path,
-            },
-            Path("/tmp"),
-            revisions={
-                "longcat-image-edit": settings.longcat_edit_revision,
-                "longcat-image-edit-turbo": settings.longcat_edit_turbo_revision,
-            },
+        GenerationAdapterSettings(
+            ideogram_weights_path=str(settings.ideogram_weights_path),
+            longcat_weights=(
+                ("longcat-image-edit", str(settings.longcat_edit_weights_path)),
+                ("longcat-image-edit-turbo", str(settings.longcat_edit_turbo_weights_path)),
+            ),
+            source_dir=str(Path("/tmp")),
+            revisions=(
+                ("longcat-image-edit", settings.longcat_edit_revision),
+                ("longcat-image-edit-turbo", settings.longcat_edit_turbo_revision),
+            ),
         ),
     )
     atexit.register(models.unload)

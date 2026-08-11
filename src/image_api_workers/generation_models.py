@@ -7,6 +7,7 @@ import os
 import threading
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Protocol
@@ -35,6 +36,32 @@ OFFICIAL_REVISIONS = {
 class GenerationAdapter(Protocol):
     def __call__(self, request: dict[str, object]) -> bytes: ...
     def unload(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class GenerationAdapterSettings:
+    """Only serializable model facts cross the CUDA child-process boundary."""
+
+    ideogram_weights_path: str
+    longcat_weights: tuple[tuple[str, str], ...]
+    source_dir: str
+    revisions: tuple[tuple[str, str], ...]
+
+
+def build_production_adapters(
+    settings: GenerationAdapterSettings,
+) -> tuple[GenerationAdapter, GenerationAdapter]:
+    """Construct lock-owning production adapters only inside the generation child."""
+    from image_api_workers.ideogram import IdeogramModel
+
+    return (
+        IdeogramModel(Path(settings.ideogram_weights_path)),
+        LongCatImageEditModel(
+            {name: Path(path) for name, path in settings.longcat_weights},
+            Path(settings.source_dir),
+            revisions=dict(settings.revisions),
+        ),
+    )
 
 
 class LongCatRuntimeUnavailable(RuntimeError):
@@ -197,15 +224,23 @@ class LongCatImageEditModel:
 
 
 def _generation_child(
-    connection: object, ideogram: GenerationAdapter, longcat: LongCatImageEditModel
+    connection: object,
+    settings: GenerationAdapterSettings,
+    adapter_factory: Callable[
+        [GenerationAdapterSettings], tuple[GenerationAdapter, GenerationAdapter]
+    ],
 ) -> None:
     """The child is the only process allowed to materialize a generation pipeline."""
     from multiprocessing.connection import Connection
 
     channel = connection
     assert isinstance(channel, Connection)
+    ideogram, longcat = adapter_factory(settings)
     while True:
-        message = channel.recv()
+        try:
+            message = channel.recv()
+        except EOFError:
+            return
         if message is None:
             return
         request = message
@@ -213,7 +248,8 @@ def _generation_child(
         adapter: GenerationAdapter = ideogram if target == "ideogram-4-nf4" else longcat
         try:
             channel.send(("ok", adapter(request)))
-        except Exception:  # noqa: BLE001 - child must serialize adapter failures for the parent
+        except Exception:  # noqa: BLE001 - child must sanitize failures for the parent
+            logger.exception("generation child request failed: model=%s", target)
             channel.send(("error", "generation adapter failed"))
 
 
@@ -222,14 +258,16 @@ class GenerationModels:
 
     def __init__(
         self,
-        ideogram: GenerationAdapter,
-        longcat: LongCatImageEditModel,
+        adapter_settings: GenerationAdapterSettings,
         *,
+        adapter_factory: Callable[
+            [GenerationAdapterSettings], tuple[GenerationAdapter, GenerationAdapter]
+        ] = build_production_adapters,
         status_path: Path | None = None,
         lifecycle_observer: Callable[[str, str, int], None] | None = None,
     ) -> None:
-        self.ideogram = ideogram
-        self.longcat = longcat
+        self._adapter_settings = adapter_settings
+        self._adapter_factory = adapter_factory
         self.status_path = status_path
         self.loaded_model: str | None = None
         self._lock = threading.RLock()
@@ -268,8 +306,10 @@ class GenerationModels:
             if self._child is None:
                 parent, child = multiprocessing.Pipe()
                 self._channel = parent
-                self._child = multiprocessing.get_context("fork").Process(
-                    target=_generation_child, args=(child, self.ideogram, self.longcat), daemon=True
+                self._child = multiprocessing.get_context("spawn").Process(
+                    target=_generation_child,
+                    args=(child, self._adapter_settings, self._adapter_factory),
+                    daemon=True,
                 )
                 self._child.start()
                 child.close()
