@@ -13,6 +13,7 @@ from image_api_workers.ideogram import (
     IdeogramModel,
     IdeogramRuntimeUnavailable,
     _legacy_extra_special_tokens_compatibility,
+    _qwen3_vl_tokenizer_config_compatibility,
 )
 
 
@@ -52,7 +53,10 @@ def test_structured_caption_runs_offline_from_mounted_weights(tmp_path, monkeypa
     )
     encoded = model(
         {
-            "structured_caption": {"description": "a bee"},
+            "structured_caption": {
+                "style": {"lighting": "soft", "palette": "warm"},
+                "description": "a bee",
+            },
             "width": 256,
             "height": 512,
             "seed": 7,
@@ -63,7 +67,10 @@ def test_structured_caption_runs_offline_from_mounted_weights(tmp_path, monkeypa
     assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
     assert os.environ["HF_HOME"] == str(weights)
     assert json.loads(status_path.read_text()) == {"state": "loaded", "loaded": True}
-    assert pipeline.calls[0][0] == '{"description":"a bee"}'
+    assert (
+        pipeline.calls[0][0]
+        == '{"style":{"lighting":"soft","palette":"warm"},"description":"a bee"}'
+    )
     with Image.open(BytesIO(encoded)) as image:
         assert image.size == (256, 512)
 
@@ -93,13 +100,16 @@ def test_legacy_list_extra_special_tokens_are_unnamed_and_mapping_behavior_is_un
     monkeypatch,
 ) -> None:
     class TokenizerBase:
-        SPECIAL_TOKENS_ATTRIBUTES = ["bos_token"]
+        SPECIAL_TOKENS_ATTRIBUTES = ("bos_token",)
 
         def __init__(self) -> None:
             self._special_tokens_map = {}
 
         def _set_model_specific_special_tokens(self, special_tokens) -> None:
-            self.SPECIAL_TOKENS_ATTRIBUTES += list(special_tokens.keys())
+            self.SPECIAL_TOKENS_ATTRIBUTES = [
+                *self.SPECIAL_TOKENS_ATTRIBUTES,
+                *special_tokens.keys(),
+            ]
             self._special_tokens_map.update(special_tokens)
 
     transformers = types.ModuleType("transformers")
@@ -137,6 +147,41 @@ def test_legacy_list_extra_special_tokens_are_unnamed_and_mapping_behavior_is_un
         TokenizerBase._set_model_specific_special_tokens.__name__
         == "_set_model_specific_special_tokens"
     )
+
+
+def test_qwen3_vl_tokenizer_load_uses_sibling_text_encoder_config_only_for_tokenizer(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class AutoConfig:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            calls.append(("config", path, kwargs))
+            return "text-encoder-config"
+
+    class AutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            calls.append(("tokenizer", path, kwargs))
+            return "tokenizer"
+
+    transformers = types.ModuleType("transformers")
+    transformers.AutoConfig = AutoConfig
+    transformers.AutoTokenizer = AutoTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    original_descriptor = AutoTokenizer.__dict__["from_pretrained"]
+    with _qwen3_vl_tokenizer_config_compatibility():
+        assert AutoTokenizer.from_pretrained("weights", subfolder="tokenizer") == "tokenizer"
+        assert AutoTokenizer.from_pretrained("weights", subfolder="other") == "tokenizer"
+
+    assert calls == [
+        ("config", "weights", {"subfolder": "text_encoder"}),
+        ("tokenizer", "weights", {"subfolder": "tokenizer", "config": "text-encoder-config"}),
+        ("tokenizer", "weights", {"subfolder": "other"}),
+    ]
+    assert AutoTokenizer.__dict__["from_pretrained"] is original_descriptor
 
 
 def test_plain_prompt_never_fakes_magic_prompt_success(tmp_path, monkeypatch) -> None:
