@@ -207,9 +207,15 @@ if generation.get("workerAvailable") is not True:
     raise SystemExit("gateway health validation failed: generation worker is unavailable")
 if generation.get("device") != "cuda":
     raise SystemExit("gateway health validation failed: generation worker device must equal cuda")
-gpu_lane = payload.get("gpuLane")
-if not isinstance(gpu_lane, dict) or gpu_lane.get("active") is not False:
-    raise SystemExit("gateway health validation failed: GPU lane must be inactive")
+coordinator = payload.get("coordinator")
+if not isinstance(coordinator, dict):
+    raise SystemExit("gateway health validation failed: coordinator must be an object")
+if coordinator.get("ready") is not True:
+    raise SystemExit("gateway health validation failed: coordinator is not ready")
+if type(coordinator.get("active")) is not int or coordinator["active"] != 0:
+    raise SystemExit("gateway health validation failed: coordinator must be idle")
+if type(coordinator.get("capacity")) is not int or coordinator["capacity"] != 1:
+    raise SystemExit("gateway health validation failed: coordinator capacity must equal 1")
 print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 PY
     then
