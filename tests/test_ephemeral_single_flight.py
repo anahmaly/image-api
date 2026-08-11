@@ -21,6 +21,11 @@ from image_api_workers.generation_models import GenerationModels
 from image_api_workers.generation_worker import create_worker_app
 
 
+@pytest.fixture(autouse=True)
+def immediate_upscale_peer_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(upscale, "_evict_peers", lambda: None)
+
+
 def test_global_single_flight_rejects_reentrant_request_and_releases_slot(tmp_path) -> None:
     coordinator = SingleFlightCoordinator()
     observed: list[int] = []
@@ -114,18 +119,14 @@ def test_upscale_evicts_background_and_generation_before_local_model_load(
         events.append("upscale-run")
         return png(size=(16, 12))
 
-    class PeerAcknowledgements:
-        def __init__(self, peers: tuple[str, ...]) -> None:
-            assert peers == ("http://background-worker:9002", "http://generation-worker:9003")
-
-        def __call__(self) -> None:
-            assert background_app.post("/internal/unload").json()["unloaded"] is True
-            events.append("background-unload")
-            assert generation_app.post("/internal/unload").json()["unloaded"] is True
+    def peer_acknowledgements() -> None:
+        assert background_app.post("/internal/unload").json()["unloaded"] is True
+        events.append("background-unload")
+        assert generation_app.post("/internal/unload").json()["unloaded"] is True
 
     monkeypatch.setattr(background, "PeerEvictor", lambda _: lambda: None)
     monkeypatch.setattr(background, "_run_background", background_run)
-    monkeypatch.setattr(upscale, "PeerEvictor", PeerAcknowledgements)
+    monkeypatch.setattr(upscale, "_evict_peers", peer_acknowledgements)
     monkeypatch.setattr(upscale, "_run", upscale_run)
     clients = {
         "upscale": TestClient(upscale.app),
@@ -181,18 +182,15 @@ def test_upscale_peer_eviction_failure_is_retryable_and_skips_local_model(
 ) -> None:
     invoked = False
 
-    def unavailable(_: tuple[str, ...]) -> Callable[[], None]:
-        def fail() -> None:
-            raise WorkerUnavailable("fixture peer unload failure")
-
-        return fail
+    def unavailable() -> None:
+        raise WorkerUnavailable("fixture peer unload failure")
 
     def local(*_: object) -> bytes:
         nonlocal invoked
         invoked = True
         return png()
 
-    monkeypatch.setattr(upscale, "PeerEvictor", unavailable)
+    monkeypatch.setattr(upscale, "_evict_peers", unavailable)
     monkeypatch.setattr(upscale, "_run", local)
     upscale_app = TestClient(upscale.app)
 

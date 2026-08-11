@@ -155,6 +155,15 @@ def _run(data: bytes, model: str, outscale: float, tile: int) -> bytes:
 app = FastAPI(title="image-api-upscale-worker", docs_url=None, redoc_url=None)
 
 
+def _evict_peers() -> None:
+    PeerEvictor(
+        (
+            os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
+            os.getenv("IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"),
+        )
+    )()
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     return _runtime_status()
@@ -179,12 +188,7 @@ async def upscale(
     try:
 
         def operation() -> bytes:
-            PeerEvictor(
-                (
-                    os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
-                    os.getenv("IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"),
-                )
-            )()
+            _evict_peers()
             with _model_lock:
                 return _run(data, model, outscale, tile)
 
