@@ -39,16 +39,17 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
                 settings.longcat_edit_turbo_weights_path, settings.longcat_edit_turbo_revision
             ),
         }
+        active_model = models.loaded_model if models.child_alive else None
         return {
             "ready": cuda and all(mounts.values()),
-            "loaded": models.loaded_model is not None,
+            "loaded": active_model is not None,
             "device": "cuda" if cuda else "unavailable",
             "weightsAvailable": all(mounts.values()),
             "models": {
-                name: {"weightsAvailable": value, "loaded": models.loaded_model == name}
+                name: {"weightsAvailable": value, "loaded": active_model == name}
                 for name, value in mounts.items()
             },
-            "loadedModel": models.loaded_model,
+            "loadedModel": active_model,
         }
 
     @app.post("/internal/unload")
@@ -66,7 +67,7 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
 
     @app.post("/internal/image-edit")
     async def edit(
-        file: UploadFile = File(),
+        file: UploadFile = File(),  # noqa: B008 - FastAPI request-field declaration
         model: str = "",
         prompt: str = "",
         negative_prompt: str = "",

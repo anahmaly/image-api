@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from helpers import png
 from PIL import Image
 
-from helpers import png
 from image_api_workers.generation_models import GenerationModels, LongCatImageEditModel
 
 
@@ -84,7 +84,7 @@ def test_longcat_uses_official_defaults_and_releases_on_model_switch(tmp_path) -
 def test_generation_model_switch_unloads_longcat_before_ideogram(tmp_path) -> None:
     events: list[object] = []
     longcat = LongCatImageEditModel(
-        {"longcat-image-edit": tmp_path},
+        {"longcat-image-edit": tmp_path, "longcat-image-edit-turbo": tmp_path},
         tmp_path,
         pipeline_factory=lambda model, _path: EditPipeline(model, events),
         cuda_available=lambda: True,
@@ -99,6 +99,21 @@ def test_generation_model_switch_unloads_longcat_before_ideogram(tmp_path) -> No
             "seed": 1,
         }
     )
-    models({"model": "ideogram-4-nf4", "width": 256, "height": 256, "seed": 1})
-    assert events[-2:] == [("hooks", "longcat-image-edit"), ("ideogram", 1)]
-    assert models.loaded_model == "ideogram-4-nf4"
+    assert models._child is not None
+    first_child = models._child
+    first_pid = first_child.pid
+    models(
+        {
+            "model": "longcat-image-edit-turbo",
+            "source_image_bytes": png(),
+            "prompt": "x",
+            "negative_prompt": "",
+            "seed": 1,
+        }
+    )
+    assert models._child is not None
+    assert models._child.pid != first_pid
+    assert first_child.is_alive() is False
+    assert models.child_alive is True
+    assert models.loaded_model == "longcat-image-edit-turbo"
+    models.unload()

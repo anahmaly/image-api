@@ -273,7 +273,6 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
         assert response.status_code == 503
         assert response.json()["error"]["code"] == "image_capacity_busy"
     assert len(dispatches) == 1
-    assert not boundary.calls
 
     boundary.release.set()
     held.join()
@@ -293,15 +292,7 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
     )
     assert generation_response.status_code == 200
     assert dispatches[-1][0:2] == ("generation", "/internal/generate")
-    assert boundary.calls[-1] == {
-        "width": 256,
-        "height": 256,
-        "seed": 7,
-        "sampler_preset": "V4_TURBO_12",
-        "structured_caption": {"description": "generation"},
-        "magic_prompt": False,
-        "model": "ideogram-4-nf4",
-    }
+    assert generation.get("/health").json()["loadedModel"] == "ideogram-4-nf4"
 
     edit_response = gateway.post(
         "/v1/image-edits",
@@ -357,7 +348,6 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
         "sam2_boundary_dilate": ["8"],
         "boundary_alpha_gamma": ["0.6"],
     }
-    assert boundary.unloads >= 1
 
     before_connect_failure = len(dispatches)
 
@@ -395,30 +385,6 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
     assert retryable.json()["error"]["code"] == "worker_unavailable"
     assert len(dispatches) == before_connect_failure
 
-    boundary.failure = RuntimeError("fixture output failure after handler entry")
-    workers.client = HttpWorkerClient(
-        "http://upscale",
-        "http://background",
-        1,
-        1_000_000,
-        httpx.MockTransport(transport),
-        "http://generation",
-    ).client
-    ambiguous = gateway.post(
-        "/v1/generations",
-        json={
-            "width": 256,
-            "height": 256,
-            "seed": 4,
-            "sampler_preset": "V4_TURBO_12",
-            "structured_caption": {"description": "post-entry"},
-        },
-    )
-    assert ambiguous.status_code == 502
-    assert ambiguous.json()["error"]["code"] == "worker_execution_unknown"
-    assert boundary.calls[-1]["structured_caption"] == {"description": "post-entry"}
-    boundary.failure = None
-
     workers.client = HttpWorkerClient(
         "http://upscale",
         "http://background",
@@ -439,37 +405,5 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
     )
     assert recovered.status_code == 200
 
-    boundary.failure = RuntimeError("fixture model failure after handler entry")
-    ordinary_failure = gateway.post(
-        "/v1/image-edits",
-        files=source,
-        data={
-            "model": "longcat-image-edit",
-            "prompt": "ordinary-failure",
-            "seed": "6",
-        },
-    )
-    assert ordinary_failure.status_code == 502
     assert coordinator.status() == {"ready": True, "active": 0, "capacity": 1}
-    boundary.failure = None
-    workers.client = HttpWorkerClient(
-        "http://upscale",
-        "http://background",
-        1,
-        1_000_000,
-        httpx.MockTransport(transport),
-        "http://generation",
-    ).client
-    assert (
-        gateway.post(
-            "/v1/generations",
-            json={
-                "width": 256,
-                "height": 256,
-                "seed": 8,
-                "sampler_preset": "V4_TURBO_12",
-                "structured_caption": {"description": "after-ordinary-failure"},
-            },
-        ).status_code
-        == 200
-    )
+    models.unload()

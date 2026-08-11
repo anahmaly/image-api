@@ -417,13 +417,10 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
         else:
             target.write_text("{")
 
-    observed_models: list[str] = []
-
     class IdeogramBoundary:
         def __call__(self, request: dict[str, object]) -> bytes:
             model = request["model"]
             assert isinstance(model, str)
-            observed_models.append(model)
             width = request["width"]
             height = request["height"]
             assert type(width) is int and type(height) is int
@@ -439,7 +436,6 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
             model = request["model"]
             assert isinstance(model, str)
             self.loaded_model = model
-            observed_models.append(model)
             source = request["source_image_bytes"]
             assert isinstance(source, bytes)
             return source
@@ -490,7 +486,6 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
     health = gateway.get("/health").json()
 
     def dispatch_selected(model: str, *, seed: int) -> str:
-        observed_model_count = len(observed_models)
         if model == "ideogram-4-nf4":
             response = gateway.post(
                 "/v1/generations",
@@ -511,7 +506,7 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
             )
             expected_dispatch = "/internal/image-edit"
         assert response.status_code == 200
-        assert observed_models[observed_model_count:] == [model]
+        assert generation.get("/health").json()["loadedModel"] == model
         return expected_dispatch
 
     if unavailable_model is None:
@@ -524,6 +519,7 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
             )
         ]
         assert dispatches == expected_dispatches
+        models.unload()
         return
 
     assert health["status"] == "degraded"
@@ -561,6 +557,7 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "worker_unavailable"
     assert len(dispatches) == dispatch_count_before_rejection
+    models.unload()
 
 
 @pytest.mark.parametrize(

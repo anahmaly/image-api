@@ -104,6 +104,7 @@ def test_generation_compose_healthcheck_requires_responsive_worker() -> None:
     assert "urllib.request.urlopen('http://127.0.0.1:9003/health', timeout=3)" in healthcheck
     assert "json.load" not in healthcheck
     assert "['ready']" not in healthcheck
+    assert "restart: on-failure" in match.group("body")
 
 
 def test_generation_compose_mounts_the_existing_physical_model_roots() -> None:
@@ -188,6 +189,8 @@ def test_generation_install_handles_pep_668_and_keeps_ideogram_pinned() -> None:
 
     assert tokens[:4] == ["python", "-m", "pip", "install"]
     assert "--break-system-packages" in tokens
+    assert "transformers==4.56.2" in tokens
+    assert "protobuf==6.33.4" in tokens
     assert (
         "git+https://github.com/ideogram-oss/ideogram4.git@990fe1c4e950bb9e9dc90e01c0ad98ba434f83c2"
     ) in tokens
