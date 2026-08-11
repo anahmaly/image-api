@@ -45,10 +45,14 @@ def _install_pr7_fakes(monkeypatch, calls: list[tuple[str, dict[str, object]]]) 
     processing.DespillOptions = lambda **kwargs: SimpleNamespace(**kwargs)
     processing.process_png_bytes = lambda data, **kwargs: data
 
+    limits = ModuleType("rembg_api.limits")
+    setattr(limits, "ImageLimits", lambda **kwargs: SimpleNamespace(**kwargs))
+
     monkeypatch.setitem(sys.modules, "rembg_api", package)
     monkeypatch.setitem(sys.modules, "rembg_api.birefnet_hr", birefnet)
     monkeypatch.setitem(sys.modules, "rembg_api.bria_rmbg", bria)
     monkeypatch.setitem(sys.modules, "rembg_api.image_processing", processing)
+    monkeypatch.setitem(sys.modules, "rembg_api.limits", limits)
 
 
 @pytest.fixture(autouse=True)
@@ -136,6 +140,14 @@ def test_pr7_backends_dispatch_with_bounded_options_and_rgba(
     else:
         assert calls[0][1]["inference_size"] == 3072
         assert calls[0][1]["foreground_refinement"] is True
+        limits = calls[0][1]["output_limits"]
+        assert vars(limits) == {
+            "max_width": 8192,
+            "max_height": 8192,
+            "max_pixels": 67_108_864,
+            "max_encoded_bytes": 300_000_000,
+        }
+        assert vars(limits)["max_encoded_bytes"] > 40_000_000
     with Image.open(BytesIO(response.content)) as image:
         assert image.format == "PNG"
         assert image.mode == "RGBA"
@@ -189,3 +201,27 @@ def test_background_postprocessing_uses_configured_encoded_ceiling(monkeypatch) 
 
     assert observed["max_encoded_bytes"] == 345_000_000
     assert encoded == png("RGBA", (13, 7))
+
+
+def test_birefnet_route_passes_configured_processing_limits_to_rembg(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    _install_pr7_fakes(monkeypatch, calls)
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_INPUT_WIDTH", "4096")
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT", "3072")
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_OUTPUT_PIXELS", "12000000")
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "345000000")
+    client = TestClient(app)
+
+    response = client.post(
+        "/internal/background-removal?model=birefnet-hr-matting",
+        files={"file": ("input.png", png("RGB", (13, 7)), "image/png")},
+    )
+
+    assert response.status_code == 200
+    limits = calls[0][1]["output_limits"]
+    assert vars(limits) == {
+        "max_width": 4096,
+        "max_height": 3072,
+        "max_pixels": 12_000_000,
+        "max_encoded_bytes": 345_000_000,
+    }
