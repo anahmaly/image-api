@@ -3,7 +3,8 @@
 .pytest_cache
 __pycache__
 *.pyc
-tests
+tests/*
+!tests/ideogram_tokenizer_compat_smoke.py
 models
 state
 1.png
