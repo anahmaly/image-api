@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import multiprocessing
 import threading
 from collections.abc import Callable
 from typing import Any, cast
@@ -101,14 +102,33 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
     elapsed-time polling, timeout, or production delay is involved.
     """
 
+    manager = multiprocessing.Manager()
+
     class ModelBoundary:
         def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
-            self.unloads = 0
+            self.calls = manager.list()
+            self.state = manager.Namespace()
+            self.state.failure = None
+            self.state.unloads = 0
             self.hold = False
-            self.failure: Exception | None = None
             self.entered = threading.Event()
             self.release = threading.Event()
+
+        @property
+        def failure(self) -> Exception | None:
+            return self.state.failure
+
+        @failure.setter
+        def failure(self, value: Exception | None) -> None:
+            self.state.failure = value
+
+        @property
+        def unloads(self) -> int:
+            return self.state.unloads
+
+        @unloads.setter
+        def unloads(self, value: int) -> None:
+            self.state.unloads = value
 
         def __call__(self, request: dict[str, object]) -> bytes:
             self.calls.append(request)
@@ -357,7 +377,8 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
         "sam2_boundary_dilate": ["8"],
         "boundary_alpha_gamma": ["0.6"],
     }
-    assert boundary.unloads >= 1
+    assert models.child_alive is False
+    assert models.loaded_model is None
 
     before_connect_failure = len(dispatches)
 

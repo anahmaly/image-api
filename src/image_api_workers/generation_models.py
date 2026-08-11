@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import gc
 import json
 import logging
+import multiprocessing
 import os
 import threading
 import uuid
+from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from PIL import Image
 
@@ -169,6 +170,8 @@ class LongCatImageEditModel:
                     generator=self._generator(seed),
                 )
                 output_image = result.images[0].convert("RGB")
+                if output_image.size != source_image.size:
+                    output_image = output_image.resize(source_image.size)
             except Exception as exc:
                 logger.error(
                     "LongCat inference failed: model=%s",
@@ -185,47 +188,37 @@ class LongCatImageEditModel:
             pipeline = self._pipeline
             self._pipeline = None
             self._loaded_model = None
-            hook_error: Exception | None = None
             if pipeline is not None:
                 for hook_name in ("_remove_all_hooks", "remove_all_hooks"):
                     remove_hooks = getattr(pipeline, hook_name, None)
                     if callable(remove_hooks):
-                        try:
-                            remove_hooks()
-                        except Exception as exc:
-                            hook_error = exc
-                            logger.error(
-                                "LongCat offload hook removal failed",
-                                exc_info=(type(exc), exc, exc.__traceback__),
-                            )
+                        remove_hooks()
                         break
-                del pipeline
-            gc.collect()
-            cuda_error: Exception | None = None
-            try:
-                import torch
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    ipc_collect = getattr(torch.cuda, "ipc_collect", None)
-                    if callable(ipc_collect):
-                        ipc_collect()
-            except ImportError:
-                pass
-            except (AttributeError, RuntimeError) as exc:
-                cuda_error = exc
-                logger.error(
-                    "LongCat CUDA cache release failed",
-                    exc_info=(type(exc), exc, exc.__traceback__),
-                )
-            if cuda_error is not None:
-                raise RuntimeError("LongCat CUDA cache release failed") from cuda_error
-            if hook_error is not None:
-                raise RuntimeError("LongCat offload hook removal failed") from hook_error
+
+def _generation_child(
+    connection: object, ideogram: GenerationAdapter, longcat: LongCatImageEditModel
+) -> None:
+    """The child is the only process allowed to materialize a generation pipeline."""
+    from multiprocessing.connection import Connection
+
+    channel = connection
+    assert isinstance(channel, Connection)
+    while True:
+        message = channel.recv()
+        if message is None:
+            return
+        request = message
+        target = request["model"]
+        adapter: GenerationAdapter = ideogram if target == "ideogram-4-nf4" else longcat
+        try:
+            channel.send(("ok", adapter(request)))
+        except Exception:  # noqa: BLE001 - child must serialize adapter failures for the parent
+            channel.send(("error", "generation adapter failed"))
 
 
 class GenerationModels:
-    """Own the one resident generation/edit model and switch it fail-safe."""
+    """Own exactly one model child; process exit is the cross-model memory boundary."""
 
     def __init__(
         self,
@@ -233,13 +226,21 @@ class GenerationModels:
         longcat: LongCatImageEditModel,
         *,
         status_path: Path | None = None,
+        lifecycle_observer: Callable[[str, str, int], None] | None = None,
     ) -> None:
         self.ideogram = ideogram
         self.longcat = longcat
         self.status_path = status_path
         self.loaded_model: str | None = None
         self._lock = threading.RLock()
+        self._child: Any | None = None
+        self._channel: object | None = None
+        self._lifecycle_observer = lifecycle_observer
         self._write_status("unloaded")
+
+    def _observe(self, event: str, model: str, live_children: int) -> None:
+        if self._lifecycle_observer is not None:
+            self._lifecycle_observer(event, model, live_children)
 
     def _write_status(self, state: str) -> None:
         if self.status_path is None:
@@ -252,6 +253,10 @@ class GenerationModels:
         temporary.write_text(json.dumps(body, sort_keys=True))
         os.replace(temporary, self.status_path)
 
+    @property
+    def child_alive(self) -> bool:
+        return self._child is not None and bool(self._child.is_alive())
+
     def __call__(self, request: dict[str, object]) -> bytes:
         target = request.get("model", "ideogram-4-nf4")
         if target != "ideogram-4-nf4" and target not in LONGCAT_MODELS:
@@ -260,45 +265,55 @@ class GenerationModels:
             if self.loaded_model is not None and self.loaded_model != target:
                 self.unload()
             self._write_status("loading")
-            adapter: GenerationAdapter = (
-                self.ideogram if target == "ideogram-4-nf4" else self.longcat
-            )
-            try:
-                encoded = adapter(request)
-            except Exception as exc:
-                ideogram_loaded = bool(getattr(self.ideogram, "loaded", False))
-                if target == "ideogram-4-nf4" and ideogram_loaded:
-                    self.loaded_model = "ideogram-4-nf4"
-                elif target in LONGCAT_MODELS and self.longcat.loaded_model == target:
-                    self.loaded_model = str(target)
-                else:
-                    self.loaded_model = None
-                self._write_status("loaded" if self.loaded_model else "unloaded")
-                logger.error(
-                    "generation adapter failed: model=%s resident_model=%s",
-                    target,
-                    self.loaded_model,
-                    exc_info=(type(exc), exc, exc.__traceback__),
+            if self._child is None:
+                parent, child = multiprocessing.Pipe()
+                self._channel = parent
+                self._child = multiprocessing.get_context("fork").Process(
+                    target=_generation_child, args=(child, self.ideogram, self.longcat), daemon=True
                 )
+                self._child.start()
+                child.close()
+                self._observe("spawn", str(target), 1)
+            try:
+                from multiprocessing.connection import Connection
+
+                channel = self._channel
+                assert isinstance(channel, Connection)
+                channel.send(request | {"model": target})
+                kind, result = channel.recv()
+                if kind != "ok" or not isinstance(result, bytes):
+                    raise RuntimeError(str(result))
+                encoded = result
+            except Exception:
+                self.unload()
                 raise
             self.loaded_model = str(target)
+            self._observe("load", self.loaded_model, 1)
             self._write_status("loaded")
             return encoded
 
     def unload(self) -> None:
         with self._lock:
-            errors: list[BaseException] = []
-            for adapter in (self.ideogram, self.longcat):
+            child = self._child
+            channel = self._channel
+            if child is not None:
+                model = self.loaded_model
                 try:
-                    adapter.unload()
-                except Exception as exc:
-                    errors.append(exc)
-                    logger.error(
-                        "generation adapter unload failed: adapter=%s",
-                        type(adapter).__name__,
-                        exc_info=(type(exc), exc, exc.__traceback__),
-                    )
+                    from multiprocessing.connection import Connection
+
+                    if isinstance(channel, Connection):
+                        channel.send(None)
+                        channel.close()
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+                child.join()
+                if child.is_alive():
+                    child.terminate()
+                    child.join()
+                if model is not None:
+                    self._observe("exit", model, 0)
+                    self._observe("reap", model, 0)
+            self._child = None
+            self._channel = None
             self.loaded_model = None
             self._write_status("unloaded")
-            if errors:
-                raise RuntimeError("one or more generation models failed to unload") from errors[0]

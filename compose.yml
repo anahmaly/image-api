@@ -97,6 +97,7 @@ services:
     volumes:
       - ${IMAGE_API_MODELS_HOST_PATH:-./models}:/models:ro
     gpus: all
+    restart: on-failure
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9003/health', timeout=3)"]
       interval: 30s
