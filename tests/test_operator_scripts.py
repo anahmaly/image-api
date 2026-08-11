@@ -28,7 +28,7 @@ def _healthy_payload() -> dict[str, object]:
                 "workerAvailable": True,
             },
         },
-        "gpuLane": {"active": False, "activeCapability": None},
+        "coordinator": {"ready": True, "active": 0, "capacity": 1},
     }
 
 
@@ -326,7 +326,13 @@ def test_run_fails_false_cuda_and_does_not_tear_down(tmp_path: Path) -> None:
         ("capabilities.upscale.ready", False),
         ("capabilities.background-removal.device", "cpu"),
         ("capabilities.generation.workerAvailable", False),
-        ("gpuLane.active", True),
+        ("coordinator", None),
+        ("coordinator", {"ready": True, "active": 0}),
+        ("coordinator.ready", False),
+        ("coordinator.active", False),
+        ("coordinator.active", 1),
+        ("coordinator.capacity", True),
+        ("coordinator.capacity", 0),
     ],
 )
 def test_run_rejects_invalid_gateway_health_contract(
