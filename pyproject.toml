@@ -48,5 +48,6 @@ module = [
   "rembg_api.*",
   "sam2.*",
   "torch",
+  "transformers.*",
 ]
 ignore_missing_imports = true

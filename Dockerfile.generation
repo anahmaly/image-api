@@ -8,6 +8,7 @@ WORKDIR /srv/image-api
 COPY pyproject.toml README.md LICENSE NOTICE.md ./
 COPY licenses ./licenses
 COPY src ./src
+COPY tests/ideogram_tokenizer_compat_smoke.py ./tests/ideogram_tokenizer_compat_smoke.py
 RUN python -m pip install --break-system-packages --no-cache-dir . \
     "torch==2.11.0" \
     "torchvision==0.26.0" \
@@ -18,5 +19,6 @@ RUN python -m pip install --break-system-packages --no-cache-dir . \
     "safetensors==0.6.2" \
     "git+https://github.com/ideogram-oss/ideogram4.git@990fe1c4e950bb9e9dc90e01c0ad98ba434f83c2"
 RUN python -c "import accelerate, diffusers, ideogram4, google.protobuf, torch, transformers; from diffusers import LongCatImageEditPipeline; assert torch.__version__.startswith('2.11.0')"
+RUN PYTHONPATH=src python tests/ideogram_tokenizer_compat_smoke.py
 USER 10001:10001
 CMD ["python", "-m", "image_api_workers.generation_worker"]
