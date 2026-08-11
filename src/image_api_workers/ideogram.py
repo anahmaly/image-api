@@ -6,16 +6,47 @@ import logging
 import os
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
 from image_api.config import ideogram_weights_available
 
 logger = logging.getLogger(__name__)
+_TOKENIZER_COMPATIBILITY_LOCK = threading.RLock()
 
 
 class IdeogramRuntimeUnavailable(RuntimeError):
     pass
+
+
+@contextmanager
+def _legacy_extra_special_tokens_compatibility() -> Any:
+    """Adapt Transformers 4.56.2's legacy list payload for one tokenizer construction."""
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+    original = PreTrainedTokenizerBase._set_model_specific_special_tokens
+
+    def set_model_specific_special_tokens(self: Any, special_tokens: Any) -> None:
+        if isinstance(special_tokens, (list, tuple)):
+            extras = list(getattr(self, "_extra_special_tokens", ()))
+            known = {str(token) for token in extras}
+            for token in special_tokens:
+                if str(token) not in known:
+                    extras.append(token)
+                    known.add(str(token))
+            self._extra_special_tokens = extras
+            return
+        original(self, special_tokens)
+
+    with _TOKENIZER_COMPATIBILITY_LOCK:
+        PreTrainedTokenizerBase._set_model_specific_special_tokens = (
+            set_model_specific_special_tokens
+        )
+        try:
+            yield
+        finally:
+            PreTrainedTokenizerBase._set_model_specific_special_tokens = original
 
 
 class IdeogramModel:
@@ -78,11 +109,12 @@ class IdeogramModel:
             import torch
             from ideogram4 import Ideogram4Pipeline, Ideogram4PipelineConfig
 
-            self._pipeline = Ideogram4Pipeline.from_pretrained(
-                config=Ideogram4PipelineConfig(weights_repo=repository),
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
+            with _legacy_extra_special_tokens_compatibility():
+                self._pipeline = Ideogram4Pipeline.from_pretrained(
+                    config=Ideogram4PipelineConfig(weights_repo=repository),
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
         except Exception as exc:
             self._write_status("unloaded")
             logger.error(

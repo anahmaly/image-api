@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import os
 import sys
+import types
 from io import BytesIO
 from types import SimpleNamespace
 
 from PIL import Image
 
-from image_api_workers.ideogram import IdeogramModel, IdeogramRuntimeUnavailable
+from image_api_workers.ideogram import (
+    IdeogramModel,
+    IdeogramRuntimeUnavailable,
+    _legacy_extra_special_tokens_compatibility,
+)
 
 
 class Pipeline:
@@ -82,6 +87,56 @@ def test_missing_weights_and_cuda_fail_honestly(tmp_path) -> None:
         raise AssertionError("missing CUDA must fail")
     except IdeogramRuntimeUnavailable as exc:
         assert "CUDA" in str(exc)
+
+
+def test_legacy_list_extra_special_tokens_are_unnamed_and_mapping_behavior_is_unchanged(
+    monkeypatch,
+) -> None:
+    class TokenizerBase:
+        SPECIAL_TOKENS_ATTRIBUTES = ["bos_token"]
+
+        def __init__(self) -> None:
+            self._special_tokens_map = {}
+
+        def _set_model_specific_special_tokens(self, special_tokens) -> None:
+            self.SPECIAL_TOKENS_ATTRIBUTES += list(special_tokens.keys())
+            self._special_tokens_map.update(special_tokens)
+
+    transformers = types.ModuleType("transformers")
+    tokenization_utils_base = types.ModuleType("transformers.tokenization_utils_base")
+    tokenization_utils_base.PreTrainedTokenizerBase = TokenizerBase
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setitem(
+        sys.modules, "transformers.tokenization_utils_base", tokenization_utils_base
+    )
+    payload = [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|object_ref_start|>",
+        "<|object_ref_end|>",
+        "<|box_start|>",
+        "<|box_end|>",
+        "<|quad_start|>",
+        "<|quad_end|>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|vision_pad|>",
+        "<|image_pad|>",
+        "<|video_pad|>",
+    ]
+    tokenizer = TokenizerBase()
+
+    with _legacy_extra_special_tokens_compatibility():
+        tokenizer._set_model_specific_special_tokens(payload)
+        tokenizer._set_model_specific_special_tokens({"image_token": "<image>"})
+
+    assert tokenizer._extra_special_tokens == payload
+    assert tokenizer._special_tokens_map == {"image_token": "<image>"}
+    assert tokenizer.SPECIAL_TOKENS_ATTRIBUTES == ["bos_token", "image_token"]
+    assert (
+        TokenizerBase._set_model_specific_special_tokens.__name__
+        == "_set_model_specific_special_tokens"
+    )
 
 
 def test_plain_prompt_never_fakes_magic_prompt_success(tmp_path, monkeypatch) -> None:
