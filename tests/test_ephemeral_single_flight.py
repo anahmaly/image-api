@@ -21,6 +21,11 @@ from image_api_workers.generation_models import GenerationModels
 from image_api_workers.generation_worker import create_worker_app
 
 
+@pytest.fixture(autouse=True)
+def immediate_upscale_peer_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(upscale, "_evict_peers", lambda: None)
+
+
 def test_global_single_flight_rejects_reentrant_request_and_releases_slot(tmp_path) -> None:
     coordinator = SingleFlightCoordinator()
     observed: list[int] = []
@@ -91,6 +96,129 @@ def test_worker_unavailability_is_retryable_without_replay(tmp_path) -> None:
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "worker_unavailable"
     assert worker.model_invocations == 1
+
+
+def test_upscale_evicts_background_and_generation_before_local_model_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    events: list[str] = []
+    background_app = TestClient(background.app)
+
+    class LoadedGeneration:
+        def unload(self) -> None:
+            events.append("generation-unload")
+
+    generation_app = TestClient(create_worker_app(LoadedGeneration(), Settings.for_tests(tmp_path)))  # type: ignore[arg-type]
+
+    def background_run(data: bytes, **_: object) -> bytes:
+        events.append("background-run")
+        return png("RGBA")
+
+    def upscale_run(data: bytes, model: str, outscale: float, tile: int) -> bytes:
+        assert events == ["background-run", "background-unload", "generation-unload"]
+        events.append("upscale-run")
+        return png(size=(16, 12))
+
+    def peer_acknowledgements() -> None:
+        assert background_app.post("/internal/unload").json()["unloaded"] is True
+        events.append("background-unload")
+        assert generation_app.post("/internal/unload").json()["unloaded"] is True
+
+    monkeypatch.setattr(background, "PeerEvictor", lambda _: lambda: None)
+    monkeypatch.setattr(background, "_run_background", background_run)
+    monkeypatch.setattr(upscale, "_evict_peers", peer_acknowledgements)
+    monkeypatch.setattr(upscale, "_run", upscale_run)
+    clients = {
+        "upscale": TestClient(upscale.app),
+        "background": background_app,
+        "generation": generation_app,
+    }
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(
+                200, json={"ready": True, "loaded": False, "device": "cpu-test"}, request=request
+            )
+        response = clients[request.url.host].request(
+            request.method,
+            request.url.raw_path.decode(),
+            content=request.content,
+            headers={"content-type": request.headers.get("content-type", "")},
+        )
+        return httpx.Response(
+            response.status_code,
+            content=response.content,
+            headers=response.headers,
+            request=request,
+        )
+
+    workers = HttpWorkerClient(
+        "http://upscale",
+        "http://background",
+        1,
+        1_000_000,
+        httpx.MockTransport(transport),
+        "http://generation",
+    )
+    gateway = TestClient(
+        create_app(
+            settings=Settings.for_tests(tmp_path),
+            workers=workers,
+            coordinator=SingleFlightCoordinator(),
+        )
+    )
+    source = {"file": ("input.png", png(), "image/png")}
+    assert (
+        gateway.post("/v1/background-removal?model=birefnet-hr-matting", files=source).status_code
+        == 200
+    )
+    response = gateway.post("/v1/upscale?model=RealESRGAN_x4plus&outscale=2&tile=0", files=source)
+    assert response.status_code == 200
+    assert events == ["background-run", "background-unload", "generation-unload", "upscale-run"]
+
+
+def test_upscale_peer_eviction_failure_is_retryable_and_skips_local_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    invoked = False
+
+    def unavailable() -> None:
+        raise WorkerUnavailable("fixture peer unload failure")
+
+    def local(*_: object) -> bytes:
+        nonlocal invoked
+        invoked = True
+        return png()
+
+    monkeypatch.setattr(upscale, "_evict_peers", unavailable)
+    monkeypatch.setattr(upscale, "_run", local)
+    upscale_app = TestClient(upscale.app)
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        response = upscale_app.request(
+            request.method,
+            request.url.raw_path.decode(),
+            content=request.content,
+            headers={"content-type": request.headers.get("content-type", "")},
+        )
+        return httpx.Response(
+            response.status_code,
+            content=response.content,
+            headers=response.headers,
+            request=request,
+        )
+
+    workers = HttpWorkerClient(
+        "http://upscale", "http://background", 1, 1_000_000, httpx.MockTransport(transport)
+    )
+    client = TestClient(create_app(settings=Settings.for_tests(tmp_path), workers=workers))
+    response = client.post(
+        "/v1/upscale?model=RealESRGAN_x4plus&outscale=2&tile=0",
+        files={"file": ("input.png", png(), "image/png")},
+    )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "worker_unavailable"
+    assert invoked is False
 
 
 def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_contention(

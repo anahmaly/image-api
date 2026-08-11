@@ -219,6 +219,16 @@ class HttpWorkerClient:
             _raise_worker_unavailable(
                 "worker connection failed before admission", _sanitize_peer_failure(exc)
             )
+        except httpx.HTTPStatusError as exc:
+            if output is not None:
+                output.close()
+            if exc.response.status_code == 503:
+                _raise_worker_unavailable(
+                    "worker unavailable before execution", _sanitize_peer_failure(exc)
+                )
+            raise WorkerExecutionFailed(
+                "worker execution result is unavailable"
+            ) from _sanitize_peer_failure(exc)
         except Exception as exc:
             if output is not None:
                 output.close()
