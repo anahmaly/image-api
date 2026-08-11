@@ -6,9 +6,10 @@ import logging
 import os
 import threading
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from image_api.config import ideogram_weights_available
 
@@ -22,7 +23,7 @@ class IdeogramRuntimeUnavailable(RuntimeError):
 
 @contextmanager
 def _legacy_extra_special_tokens_compatibility() -> Any:
-    """Adapt Transformers 4.56.2's legacy list payload for one tokenizer construction."""
+    """Adapt the legacy list payload for one tokenizer construction."""
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
     original = PreTrainedTokenizerBase._set_model_specific_special_tokens
@@ -47,6 +48,37 @@ def _legacy_extra_special_tokens_compatibility() -> Any:
             yield
         finally:
             PreTrainedTokenizerBase._set_model_specific_special_tokens = original
+
+
+@contextmanager
+def _qwen3_vl_tokenizer_config_compatibility() -> Any:
+    """Give Transformers 5 the sibling text-encoder config for the tokenizer."""
+    from transformers import AutoConfig, AutoTokenizer
+
+    original_descriptor = AutoTokenizer.__dict__["from_pretrained"]
+    original = AutoTokenizer.from_pretrained
+
+    def from_pretrained(
+        cls: Any,
+        pretrained_model_name_or_path: Any,
+        *inputs: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if kwargs.get("subfolder") == "tokenizer" and "config" not in kwargs:
+            config_kwargs = dict(kwargs)
+            config_kwargs["subfolder"] = "text_encoder"
+            kwargs["config"] = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path,
+                **config_kwargs,
+            )
+        return original(pretrained_model_name_or_path, *inputs, **kwargs)
+
+    with _TOKENIZER_COMPATIBILITY_LOCK:
+        AutoTokenizer.from_pretrained = classmethod(from_pretrained)
+        try:
+            yield
+        finally:
+            AutoTokenizer.from_pretrained = original_descriptor
 
 
 class IdeogramModel:
@@ -109,7 +141,10 @@ class IdeogramModel:
             import torch
             from ideogram4 import Ideogram4Pipeline, Ideogram4PipelineConfig
 
-            with _legacy_extra_special_tokens_compatibility():
+            with (
+                _legacy_extra_special_tokens_compatibility(),
+                _qwen3_vl_tokenizer_config_compatibility(),
+            ):
                 self._pipeline = Ideogram4Pipeline.from_pretrained(
                     config=Ideogram4PipelineConfig(weights_repo=repository),
                     device="cuda",
@@ -153,7 +188,7 @@ class IdeogramModel:
             raise ValueError("plain prompt must be a string")
         pipeline = self._load()
         if caption is not None:
-            prompt = json.dumps(caption, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            prompt = json.dumps(caption, separators=(",", ":"), ensure_ascii=False)
         else:
             backend = os.getenv("IMAGE_API_MAGIC_PROMPT_BACKEND")
             key = os.getenv("IMAGE_API_MAGIC_PROMPT_API_KEY")

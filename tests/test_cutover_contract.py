@@ -189,7 +189,7 @@ def test_generation_install_handles_pep_668_and_keeps_ideogram_pinned() -> None:
 
     assert tokens[:4] == ["python", "-m", "pip", "install"]
     assert "--break-system-packages" in tokens
-    assert "transformers==4.56.2" in tokens
+    assert "transformers==5.5.0" in tokens
     assert "protobuf==6.33.4" in tokens
     assert (
         "git+https://github.com/ideogram-oss/ideogram4.git@990fe1c4e950bb9e9dc90e01c0ad98ba434f83c2"
@@ -199,3 +199,10 @@ def test_generation_install_handles_pep_668_and_keeps_ideogram_pinned() -> None:
         for path in dockerfiles
         if path.name != "Dockerfile.generation"
     )
+
+
+def test_generation_worker_starts_with_ideogram_snapshot_as_hf_home() -> None:
+    compose = (ROOT / "compose.yml").read_text()
+    match = re.search(r"(?ms)^  generation-worker:\n(?P<body>.*?)(?=^  \S|\Z)", compose)
+    assert match is not None
+    assert "HF_HOME: /models/ideogram-4-nf4" in match.group("body")
