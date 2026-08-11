@@ -15,6 +15,7 @@ from fastapi.responses import Response
 from PIL import Image
 
 from image_api.images import ImageTooLarge, validate_dimensions, validate_png_output
+from image_api.workers import PeerEvictor, WorkerUnavailable
 from image_api_workers.execution import execute_in_gpu_lane
 from image_api_workers.uploads import read_bounded_upload
 
@@ -176,11 +177,22 @@ async def upscale(
         file, int(os.getenv("IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES", "280000000"))
     )
     try:
+
+        def operation() -> bytes:
+            PeerEvictor(
+                (
+                    os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
+                    os.getenv("IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"),
+                )
+            )()
+            with _model_lock:
+                return _run(data, model, outscale, tile)
+
         return Response(
-            await asyncio.to_thread(
-                execute_in_gpu_lane, "upscale", lambda: _run(data, model, outscale, tile)
-            ),
+            await asyncio.to_thread(execute_in_gpu_lane, "upscale", operation),
             media_type="image/png",
         )
+    except WorkerUnavailable as exc:
+        raise HTTPException(503, "peer model eviction unavailable") from exc
     except Exception as exc:
         raise HTTPException(500, "internal image processing error") from exc
