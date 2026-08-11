@@ -448,7 +448,14 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
         "torch",
         types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: True)),
     )
-    models = GenerationModels(cast(Any, IdeogramBoundary()), cast(Any, LongCatBoundary()))
+    lifecycle: list[tuple[str, str, int]] = []
+    models = GenerationModels(
+        cast(Any, IdeogramBoundary()),
+        cast(Any, LongCatBoundary()),
+        lifecycle_observer=lambda event, model, live_children: lifecycle.append(
+            (event, model, live_children)
+        ),
+    )
     generation = TestClient(create_worker_app(models, settings))
     dispatches: list[str] = []
 
@@ -519,6 +526,19 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
             )
         ]
         assert dispatches == expected_dispatches
+        assert lifecycle == [
+            ("spawn", "ideogram-4-nf4", 1),
+            ("load", "ideogram-4-nf4", 1),
+            ("exit", "ideogram-4-nf4", 0),
+            ("reap", "ideogram-4-nf4", 0),
+            ("spawn", "longcat-image-edit", 1),
+            ("load", "longcat-image-edit", 1),
+            ("exit", "longcat-image-edit", 0),
+            ("reap", "longcat-image-edit", 0),
+            ("spawn", "longcat-image-edit-turbo", 1),
+            ("load", "longcat-image-edit-turbo", 1),
+        ]
+        assert max(live_children for _, _, live_children in lifecycle) == 1
         models.unload()
         return
 

@@ -226,6 +226,7 @@ class GenerationModels:
         longcat: LongCatImageEditModel,
         *,
         status_path: Path | None = None,
+        lifecycle_observer: Callable[[str, str, int], None] | None = None,
     ) -> None:
         self.ideogram = ideogram
         self.longcat = longcat
@@ -234,7 +235,12 @@ class GenerationModels:
         self._lock = threading.RLock()
         self._child: Any | None = None
         self._channel: object | None = None
+        self._lifecycle_observer = lifecycle_observer
         self._write_status("unloaded")
+
+    def _observe(self, event: str, model: str, live_children: int) -> None:
+        if self._lifecycle_observer is not None:
+            self._lifecycle_observer(event, model, live_children)
 
     def _write_status(self, state: str) -> None:
         if self.status_path is None:
@@ -267,6 +273,7 @@ class GenerationModels:
                 )
                 self._child.start()
                 child.close()
+                self._observe("spawn", str(target), 1)
             try:
                 from multiprocessing.connection import Connection
 
@@ -281,6 +288,7 @@ class GenerationModels:
                 self.unload()
                 raise
             self.loaded_model = str(target)
+            self._observe("load", self.loaded_model, 1)
             self._write_status("loaded")
             return encoded
 
@@ -289,6 +297,7 @@ class GenerationModels:
             child = self._child
             channel = self._channel
             if child is not None:
+                model = self.loaded_model
                 try:
                     from multiprocessing.connection import Connection
 
@@ -301,6 +310,9 @@ class GenerationModels:
                 if child.is_alive():
                     child.terminate()
                     child.join()
+                if model is not None:
+                    self._observe("exit", model, 0)
+                    self._observe("reap", model, 0)
             self._child = None
             self._channel = None
             self.loaded_model = None
