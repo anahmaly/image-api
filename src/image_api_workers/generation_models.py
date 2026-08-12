@@ -15,14 +15,17 @@ from typing import Any, Protocol
 from PIL import Image
 
 from image_api.config import (
+    FLUX_2_KLEIN_4B_REVISION,
     LONGCAT_EDIT_REVISION,
     LONGCAT_EDIT_TURBO_REVISION,
+    flux_2_klein_weights_available,
     longcat_weights_available,
 )
 
 logger = logging.getLogger(__name__)
 
 LONGCAT_MODELS = ("longcat-image-edit", "longcat-image-edit-turbo")
+FLUX_2_KLEIN_4B = "flux-2-klein-4b"
 OFFICIAL_DEFAULTS = {
     "longcat-image-edit": {"guidance_scale": 4.5, "num_inference_steps": 50},
     "longcat-image-edit-turbo": {"guidance_scale": 1.0, "num_inference_steps": 8},
@@ -44,13 +47,14 @@ class GenerationAdapterSettings:
 
     ideogram_weights_path: str
     longcat_weights: tuple[tuple[str, str], ...]
+    flux_2_klein_4b_weights_path: str
     source_dir: str
     revisions: tuple[tuple[str, str], ...]
 
 
 def build_production_adapters(
     settings: GenerationAdapterSettings,
-) -> tuple[GenerationAdapter, GenerationAdapter]:
+) -> tuple[GenerationAdapter, GenerationAdapter, GenerationAdapter]:
     """Construct lock-owning production adapters only inside the generation child."""
     from image_api_workers.ideogram import IdeogramModel
 
@@ -61,6 +65,7 @@ def build_production_adapters(
             Path(settings.source_dir),
             revisions=dict(settings.revisions),
         ),
+        Flux2KleinModel(Path(settings.flux_2_klein_4b_weights_path)),
     )
 
 
@@ -223,11 +228,118 @@ class LongCatImageEditModel:
                         break
 
 
+class Flux2KleinModel:
+    """Offline FLUX.2 Klein adapter for text generation and source-image remixing."""
+
+    def __init__(
+        self,
+        weights_path: Path,
+        *,
+        revision: str = FLUX_2_KLEIN_4B_REVISION,
+        pipeline_factory: Callable[[Path], Any] | None = None,
+        generator_factory: Callable[[int], object] | None = None,
+        cuda_available: Callable[[], bool] | None = None,
+    ) -> None:
+        self.weights_path = weights_path
+        self.revision = revision
+        self._pipeline_factory = pipeline_factory
+        self._generator_factory = generator_factory
+        self._cuda_available = cuda_available
+        self._pipeline: Any | None = None
+        self._lock = threading.RLock()
+
+    def _load(self) -> Any:
+        if self._pipeline is not None:
+            return self._pipeline
+        if self._pipeline_factory is None and not flux_2_klein_weights_available(
+            self.weights_path, self.revision
+        ):
+            raise LongCatRuntimeUnavailable("configured FLUX.2 Klein weight mount is incomplete")
+        cuda = self._cuda_available
+        if cuda is None:
+            import torch
+
+            cuda = torch.cuda.is_available
+        if not cuda():
+            raise LongCatRuntimeUnavailable("FLUX.2 Klein requires CUDA")
+        try:
+            if self._pipeline_factory is not None:
+                pipeline = self._pipeline_factory(self.weights_path)
+            else:
+                import torch
+                from diffusers import Flux2KleinPipeline
+
+                pipeline = Flux2KleinPipeline.from_pretrained(
+                    str(self.weights_path), local_files_only=True, torch_dtype=torch.bfloat16
+                )
+            pipeline.enable_model_cpu_offload()
+        except Exception as exc:
+            logger.error("FLUX.2 Klein runtime initialization failed", exc_info=exc)
+            raise LongCatRuntimeUnavailable("FLUX.2 Klein runtime initialization failed") from None
+        self._pipeline = pipeline
+        return pipeline
+
+    def _generator(self, seed: int) -> object:
+        if self._generator_factory is not None:
+            return self._generator_factory(seed)
+        if self._pipeline_factory is not None:
+            return ("cuda", seed)
+        import torch
+
+        return torch.Generator(device="cuda").manual_seed(seed)
+
+    def __call__(self, request: dict[str, object]) -> bytes:
+        with self._lock:
+            prompt, seed = request.get("prompt"), request.get("seed")
+            if not isinstance(prompt, str) or not 1 <= len(prompt) <= 4000:
+                raise ValueError("invalid persisted FLUX.2 Klein prompt")
+            if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
+                raise ValueError("invalid persisted FLUX.2 Klein seed")
+            parameters: dict[str, object] = {"prompt": prompt, "generator": self._generator(seed)}
+            source_bytes = request.get("source_image_bytes")
+            if isinstance(source_bytes, bytes):
+                try:
+                    with Image.open(BytesIO(source_bytes)) as opened:
+                        opened.load()
+                        source_image = opened.convert("RGB")
+                except (OSError, ValueError):
+                    raise LongCatRuntimeUnavailable(
+                        "persisted source image is unavailable"
+                    ) from None
+                parameters["image"] = source_image
+            else:
+                width, height = request.get("width"), request.get("height")
+                if type(width) is not int or type(height) is not int:
+                    raise ValueError("invalid persisted FLUX.2 Klein dimensions")
+                parameters |= {
+                    "width": width,
+                    "height": height,
+                    "guidance_scale": 1.0,
+                    "num_inference_steps": 4,
+                }
+            try:
+                image = self._load()(**parameters).images[0].convert("RGB")
+            except Exception as exc:
+                logger.error("FLUX.2 Klein inference failed", exc_info=exc)
+                raise LongCatRuntimeUnavailable("FLUX.2 Klein inference failed") from None
+            output = BytesIO()
+            image.save(output, "PNG")
+            return output.getvalue()
+
+    def unload(self) -> None:
+        with self._lock:
+            pipeline, self._pipeline = self._pipeline, None
+            if pipeline is not None:
+                remove_hooks = getattr(pipeline, "remove_all_hooks", None)
+                if callable(remove_hooks):
+                    remove_hooks()
+
+
 def _generation_child(
     connection: object,
     settings: GenerationAdapterSettings,
     adapter_factory: Callable[
-        [GenerationAdapterSettings], tuple[GenerationAdapter, GenerationAdapter]
+        [GenerationAdapterSettings], tuple[GenerationAdapter, GenerationAdapter, GenerationAdapter]
     ],
 ) -> None:
     """The child is the only process allowed to materialize a generation pipeline."""
@@ -235,7 +347,7 @@ def _generation_child(
 
     channel = connection
     assert isinstance(channel, Connection)
-    ideogram, longcat = adapter_factory(settings)
+    ideogram, longcat, flux_2_klein = adapter_factory(settings)
     while True:
         try:
             message = channel.recv()
@@ -245,10 +357,16 @@ def _generation_child(
             return
         request = message
         target = request["model"]
-        adapter: GenerationAdapter = ideogram if target == "ideogram-4-nf4" else longcat
+        adapter: GenerationAdapter = (
+            ideogram
+            if target == "ideogram-4-nf4"
+            else flux_2_klein
+            if target == FLUX_2_KLEIN_4B
+            else longcat
+        )
         try:
             channel.send(("ok", adapter(request)))
-        except Exception:  # noqa: BLE001 - child must sanitize failures for the parent
+        except Exception:
             logger.exception("generation child request failed: model=%s", target)
             channel.send(("error", "generation adapter failed"))
 
@@ -261,7 +379,8 @@ class GenerationModels:
         adapter_settings: GenerationAdapterSettings,
         *,
         adapter_factory: Callable[
-            [GenerationAdapterSettings], tuple[GenerationAdapter, GenerationAdapter]
+            [GenerationAdapterSettings],
+            tuple[GenerationAdapter, GenerationAdapter, GenerationAdapter],
         ] = build_production_adapters,
         status_path: Path | None = None,
         lifecycle_observer: Callable[[str, str, int], None] | None = None,
@@ -297,7 +416,11 @@ class GenerationModels:
 
     def __call__(self, request: dict[str, object]) -> bytes:
         target = request.get("model", "ideogram-4-nf4")
-        if target != "ideogram-4-nf4" and target not in LONGCAT_MODELS:
+        if (
+            target != "ideogram-4-nf4"
+            and target not in LONGCAT_MODELS
+            and target != FLUX_2_KLEIN_4B
+        ):
             raise ValueError("invalid persisted generation model")
         with self._lock:
             if self.loaded_model is not None and self.loaded_model != target:

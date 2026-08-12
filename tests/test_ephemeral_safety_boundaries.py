@@ -9,15 +9,18 @@ from typing import cast
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-
 from helpers import png
-from spawn_adapters import build_adapters, settings as spawn_settings
+from spawn_adapters import build_adapters
+from spawn_adapters import settings as spawn_settings
+
 from image_api.app import RequestBodyLimitMiddleware, create_app
 from image_api.config import (
+    FLUX_2_KLEIN_4B_REVISION,
     LONGCAT_EDIT_REVISION,
     LONGCAT_EDIT_TURBO_REVISION,
     MAX_SNAPSHOT_JSON_BYTES,
     Settings,
+    flux_2_klein_weights_available,
     ideogram_weights_available,
     longcat_weights_available,
 )
@@ -82,9 +85,11 @@ def test_gateway_rejects_declared_and_streamed_request_bodies_before_multipart(
     (
         (
             "/v1/image-edits",
-            b'Content-Disposition: form-data; name="model"\r\n\r\nlongcat-image-edit\r\n'
-            b'--test-boundary\r\nContent-Disposition: form-data; name="prompt"\r\n\r\nedit\r\n'
-            b'--test-boundary\r\nContent-Disposition: form-data; name="seed"\r\n\r\n9\r\n',
+            (
+                b'Content-Disposition: form-data; name="model"\r\n\r\nlongcat-image-edit\r\n'
+                b'--test-boundary\r\nContent-Disposition: form-data; name="prompt"\r\n\r\nedit\r\n'
+                b'--test-boundary\r\nContent-Disposition: form-data; name="seed"\r\n\r\n9\r\n'
+            ),
             "max_request_bytes",
         ),
         (
@@ -218,6 +223,31 @@ def _longcat_snapshot(root, revision: str, *, sharded: bool = False, merge_size:
     return root
 
 
+def _flux_2_klein_snapshot(root):
+    root.mkdir(parents=True)
+    (root / ".image-api-revision").write_text(FLUX_2_KLEIN_4B_REVISION)
+    for name in (
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "text_encoder/config.json",
+        "tokenizer/tokenizer_config.json",
+        "tokenizer/tokenizer.json",
+        "transformer/config.json",
+        "vae/config.json",
+    ):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    (root / "tokenizer/merges.txt").write_text("merge")
+    for component, filename in (
+        ("text_encoder", "model.safetensors"),
+        ("transformer", "diffusion_pytorch_model.safetensors"),
+        ("vae", "diffusion_pytorch_model.safetensors"),
+    ):
+        (root / component / filename).write_bytes(b"weights")
+    return root
+
+
 def _write_json_of_size(path, size: int) -> None:
     prefix = b'{"tokenizer":"'
     suffix = b'"}'
@@ -239,12 +269,14 @@ def test_production_composed_physical_model_layout_admits_all_configured_models(
         LONGCAT_EDIT_TURBO_REVISION,
         merge_size=1_671_839,
     )
+    flux = _flux_2_klein_snapshot(models_root / "flux-2-klein-4b")
     settings = Settings.for_tests(
         tmp_path,
         generation_test_mode=False,
         ideogram_weights_path=models_root / "ideogram-4-nf4",
         longcat_edit_weights_path=standard,
         longcat_edit_turbo_weights_path=turbo,
+        flux_2_klein_4b_weights_path=flux,
     )
 
     class Adapter:
@@ -272,11 +304,13 @@ def test_production_composed_physical_model_layout_admits_all_configured_models(
     assert ideogram_weights_available(models_root / "ideogram-4-nf4", "ideogram-ai/ideogram-4-nf4")
     assert longcat_weights_available(standard, LONGCAT_EDIT_REVISION)
     assert longcat_weights_available(turbo, LONGCAT_EDIT_TURBO_REVISION)
+    assert flux_2_klein_weights_available(flux, FLUX_2_KLEIN_4B_REVISION)
     assert health["ready"] is True
     assert health["models"] == {
         "ideogram-4-nf4": {"weightsAvailable": True, "loaded": False},
         "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
         "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
+        "flux-2-klein-4b": {"weightsAvailable": True, "loaded": False},
     }
 
 
@@ -285,6 +319,7 @@ def test_official_tokenizer_json_sizes_reach_generation_readiness(monkeypatch, t
     ideogram = _ideogram_snapshot(settings.ideogram_weights_path)
     standard = _longcat_snapshot(settings.longcat_edit_weights_path, LONGCAT_EDIT_REVISION)
     turbo = _longcat_snapshot(settings.longcat_edit_turbo_weights_path, LONGCAT_EDIT_TURBO_REVISION)
+    _flux_2_klein_snapshot(settings.flux_2_klein_4b_weights_path)
     _write_json_of_size(ideogram / "tokenizer/tokenizer.json", 11_422_650)
     for snapshot in (standard, turbo):
         _write_json_of_size(snapshot / "text_processor/tokenizer.json", 7_031_645)
@@ -318,6 +353,7 @@ def test_official_tokenizer_json_sizes_reach_generation_readiness(monkeypatch, t
         "ideogram-4-nf4": {"weightsAvailable": True, "loaded": False},
         "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
         "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
+        "flux-2-klein-4b": {"weightsAvailable": True, "loaded": False},
     }
 
 
@@ -392,6 +428,8 @@ def test_snapshot_validation_rejects_malformed_or_unsafe_loader_inputs(
         ("longcat-image-edit", "malformed"),
         ("longcat-image-edit-turbo", "missing"),
         ("longcat-image-edit-turbo", "malformed"),
+        ("flux-2-klein-4b", "missing"),
+        ("flux-2-klein-4b", "malformed"),
     ),
 )
 def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selection(
@@ -406,10 +444,12 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
     ideogram = _ideogram_snapshot(settings.ideogram_weights_path)
     standard = _longcat_snapshot(settings.longcat_edit_weights_path, LONGCAT_EDIT_REVISION)
     turbo = _longcat_snapshot(settings.longcat_edit_turbo_weights_path, LONGCAT_EDIT_TURBO_REVISION)
+    flux = _flux_2_klein_snapshot(settings.flux_2_klein_4b_weights_path)
     snapshots = {
         "ideogram-4-nf4": ideogram / "vae/config.json",
         "longcat-image-edit": standard / "config.json",
         "longcat-image-edit-turbo": turbo / "config.json",
+        "flux-2-klein-4b": flux / "vae/config.json",
     }
     if unavailable_model is not None:
         target = snapshots[unavailable_model]
@@ -494,16 +534,23 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
     health = gateway.get("/health").json()
 
     def dispatch_selected(model: str, *, seed: int) -> str:
-        if model == "ideogram-4-nf4":
-            response = gateway.post(
-                "/v1/generations",
-                json={
-                    "width": 256,
-                    "height": 256,
-                    "seed": seed,
+        if model in {"ideogram-4-nf4", "flux-2-klein-4b"}:
+            payload: dict[str, object] = {
+                "model": model,
+                "width": 256,
+                "height": 256,
+                "seed": seed,
+            }
+            if model == "ideogram-4-nf4":
+                payload |= {
                     "sampler_preset": "V4_TURBO_12",
                     "structured_caption": {"description": "generation"},
-                },
+                }
+            else:
+                payload["prompt"] = "exact generation"
+            response = gateway.post(
+                "/v1/generations",
+                json=payload,
             )
             expected_dispatch = "/internal/generate"
         else:
@@ -523,7 +570,13 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
         expected_dispatches = [
             dispatch_selected(model, seed=index)
             for index, model in enumerate(
-                ("ideogram-4-nf4", "longcat-image-edit", "longcat-image-edit-turbo"), start=1
+                (
+                    "ideogram-4-nf4",
+                    "flux-2-klein-4b",
+                    "longcat-image-edit",
+                    "longcat-image-edit-turbo",
+                ),
+                start=1,
             )
         ]
         assert dispatches == expected_dispatches
@@ -532,6 +585,10 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
             ("load", "ideogram-4-nf4", 1),
             ("exit", "ideogram-4-nf4", 0),
             ("reap", "ideogram-4-nf4", 0),
+            ("spawn", "flux-2-klein-4b", 1),
+            ("load", "flux-2-klein-4b", 1),
+            ("exit", "flux-2-klein-4b", 0),
+            ("reap", "flux-2-klein-4b", 0),
             ("spawn", "longcat-image-edit", 1),
             ("load", "longcat-image-edit", 1),
             ("exit", "longcat-image-edit", 0),
@@ -549,7 +606,12 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
     assert generation_health["models"][unavailable_model]["weightsAvailable"] is False
     available_models = tuple(
         model
-        for model in ("ideogram-4-nf4", "longcat-image-edit", "longcat-image-edit-turbo")
+        for model in (
+            "ideogram-4-nf4",
+            "flux-2-klein-4b",
+            "longcat-image-edit",
+            "longcat-image-edit-turbo",
+        )
         if model != unavailable_model
     )
     expected_dispatches = [
@@ -652,6 +714,7 @@ def test_malformed_worker_health_json_degrades_gateway_and_blocks_dispatch(
             "ideogram-4-nf4": {"weightsAvailable": True, "loaded": False},
             "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
             "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
+            "flux-2-klein-4b": {"weightsAvailable": True, "loaded": False},
         },
     }
     models = cast(dict[str, dict[str, object]], health["models"])

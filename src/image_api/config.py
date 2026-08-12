@@ -11,6 +11,7 @@ REPOSITORY_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SNAPSHOT_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 LONGCAT_EDIT_REVISION = "7b54ef423aa7854be7861600024be5c56ab7875a"
 LONGCAT_EDIT_TURBO_REVISION = "6a7262de5549f0bf0ec54c08ef7d283ef41f3214"
+FLUX_2_KLEIN_4B_REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
 SQUARE_8K_EDGE = 8192
 MAX_SNAPSHOT_MARKER_BYTES = 65
 MAX_SNAPSHOT_JSON_BYTES = 12_000_000
@@ -163,13 +164,49 @@ def longcat_weights_available(weights_path: Path, revision: str) -> bool:
     )
 
 
+def flux_2_klein_weights_available(weights_path: Path, revision: str) -> bool:
+    marker = _read_bounded(weights_path / ".image-api-revision", MAX_SNAPSHOT_MARKER_BYTES)
+    if marker is None:
+        return False
+    try:
+        installed = marker.decode().strip()
+    except UnicodeDecodeError:
+        return False
+    return (
+        installed == revision
+        and all(
+            _json_object_available(weights_path / item)
+            for item in (
+                "model_index.json",
+                "scheduler/scheduler_config.json",
+                "text_encoder/config.json",
+                "tokenizer/tokenizer_config.json",
+                "tokenizer/tokenizer.json",
+                "transformer/config.json",
+                "vae/config.json",
+            )
+        )
+        and _text_available(weights_path / "tokenizer/merges.txt")
+        and all(
+            _weights_available(weights_path / component, filename)
+            for component, filename in (
+                ("text_encoder", "model.safetensors"),
+                ("transformer", "diffusion_pytorch_model.safetensors"),
+                ("vae", "diffusion_pytorch_model.safetensors"),
+            )
+        )
+    )
+
+
 @dataclass(frozen=True)
 class Settings:
     ideogram_weights_path: Path
     longcat_edit_weights_path: Path
     longcat_edit_turbo_weights_path: Path
+    flux_2_klein_4b_weights_path: Path
     longcat_edit_revision: str = LONGCAT_EDIT_REVISION
     longcat_edit_turbo_revision: str = LONGCAT_EDIT_TURBO_REVISION
+    flux_2_klein_4b_revision: str = FLUX_2_KLEIN_4B_REVISION
     max_upload_bytes: int = 20_000_000
     max_request_bytes: int = 21_000_000
     max_input_width: int = 10_000
@@ -206,6 +243,9 @@ class Settings:
                 os.getenv(
                     "IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH", "/models/longcat-image-edit-turbo"
                 )
+            ),
+            flux_2_klein_4b_weights_path=Path(
+                os.getenv("IMAGE_API_FLUX_2_KLEIN_4B_WEIGHTS_PATH", "/models/flux-2-klein-4b")
             ),
             worker_timeout_seconds=float(os.getenv("IMAGE_API_WORKER_TIMEOUT_SECONDS", "900")),
             max_upload_bytes=int(os.getenv("IMAGE_API_MAX_UPLOAD_BYTES", "20000000")),
@@ -250,6 +290,7 @@ class Settings:
             ideogram_weights_path=root / "ideogram",
             longcat_edit_weights_path=root / "longcat",
             longcat_edit_turbo_weights_path=root / "longcat-turbo",
+            flux_2_klein_4b_weights_path=root / "flux-2-klein-4b",
             max_upload_bytes=1_000_000,
             max_request_bytes=1_001_000,
             max_input_pixels=1_000_000,

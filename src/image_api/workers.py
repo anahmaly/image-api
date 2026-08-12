@@ -148,6 +148,7 @@ class HttpWorkerClient:
                     "ideogram-4-nf4",
                     "longcat-image-edit",
                     "longcat-image-edit-turbo",
+                    "flux-2-klein-4b",
                 }
                 result["models"] = {
                     name: {
@@ -333,6 +334,7 @@ class FakeWorkerClient:
                     "ideogram-4-nf4": {"weightsAvailable": True, "loaded": False},
                     "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
                     "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
+                    "flux-2-klein-4b": {"weightsAvailable": True, "loaded": False},
                 }
             result[capability] = status
         return result
