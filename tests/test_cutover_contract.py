@@ -192,6 +192,7 @@ def test_generation_install_handles_pep_668_and_keeps_ideogram_pinned() -> None:
     assert "--break-system-packages" in tokens
     assert "transformers==5.5.0" in tokens
     assert "protobuf==6.33.4" in tokens
+    assert "safetensors==0.8.0rc0" in tokens
     assert (
         "git+https://github.com/huggingface/diffusers.git@236e5dd9f38e21ae40c002539368b9be9a5e0fc8"
     ) in tokens

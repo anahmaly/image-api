@@ -16,7 +16,7 @@ RUN python -m pip install --break-system-packages --no-cache-dir . \
     "transformers==5.5.0" \
     "accelerate==1.11.0" \
     "protobuf==6.33.4" \
-    "safetensors==0.6.2" \
+    "safetensors==0.8.0rc0" \
     "git+https://github.com/ideogram-oss/ideogram4.git@990fe1c4e950bb9e9dc90e01c0ad98ba434f83c2"
 RUN python -c "import accelerate, diffusers, ideogram4, google.protobuf, torch, transformers; from diffusers import Flux2KleinPipeline, LongCatImageEditPipeline; assert torch.__version__.startswith('2.11.0')"
 RUN PYTHONPATH=src python tests/ideogram_tokenizer_compat_smoke.py
