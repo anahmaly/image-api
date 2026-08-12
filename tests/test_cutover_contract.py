@@ -116,6 +116,7 @@ def test_generation_compose_mounts_the_existing_physical_model_roots() -> None:
     assert "IMAGE_API_IDEOGRAM_WEIGHTS_PATH: /models/ideogram-4-nf4" in worker
     assert "IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH: /models/longcat-image-edit" in worker
     assert "IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH: /models/longcat-image-edit-turbo" in worker
+    assert "IMAGE_API_FLUX_2_KLEIN_4B_WEIGHTS_PATH: /models/flux-2-klein-4b" in worker
 
 
 def test_gateway_compose_healthcheck_accepts_truthful_partial_gateway_readiness() -> None:
@@ -191,9 +192,14 @@ def test_generation_install_handles_pep_668_and_keeps_ideogram_pinned() -> None:
     assert "--break-system-packages" in tokens
     assert "transformers==5.5.0" in tokens
     assert "protobuf==6.33.4" in tokens
+    assert "safetensors==0.8.0rc0" in tokens
+    assert (
+        "git+https://github.com/huggingface/diffusers.git@236e5dd9f38e21ae40c002539368b9be9a5e0fc8"
+    ) in tokens
     assert (
         "git+https://github.com/ideogram-oss/ideogram4.git@990fe1c4e950bb9e9dc90e01c0ad98ba434f83c2"
     ) in tokens
+    assert "from diffusers import Flux2KleinPipeline, LongCatImageEditPipeline" in generation
     assert all(
         "--break-system-packages" not in path.read_text()
         for path in dockerfiles

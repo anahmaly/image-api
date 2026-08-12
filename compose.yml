@@ -93,6 +93,7 @@ services:
       IMAGE_API_IDEOGRAM_REPOSITORY_ID: ideogram-ai/ideogram-4-nf4
       IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH: /models/longcat-image-edit
       IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH: /models/longcat-image-edit-turbo
+      IMAGE_API_FLUX_2_KLEIN_4B_WEIGHTS_PATH: /models/flux-2-klein-4b
       NO_PROXY: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
       no_proxy: localhost,127.0.0.1,::1,upscale-worker,background-worker,generation-worker
     volumes:

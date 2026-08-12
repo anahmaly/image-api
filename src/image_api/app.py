@@ -31,19 +31,32 @@ UPSCALE_MODELS = ("RealESRGAN_x4plus", "RealESRGAN_x4plus_anime_6B")
 BACKGROUND_MODELS = ("bria-rmbg-2.0", "birefnet-hr-matting")
 SAMPLER_PRESETS = ("V4_QUALITY_48", "V4_DEFAULT_20", "V4_TURBO_12")
 LONGCAT_MODELS = ("longcat-image-edit", "longcat-image-edit-turbo")
+FLUX_2_KLEIN_4B = "flux-2-klein-4b"
 
 
 class GenerationRequest(BaseModel):
+    model: Literal["ideogram-4-nf4", "flux-2-klein-4b"] = "ideogram-4-nf4"
     width: int = Field(ge=256, le=2048, multiple_of=16)
     height: int = Field(ge=256, le=2048, multiple_of=16)
     seed: int = Field(ge=0, le=2**32 - 1)
-    sampler_preset: Literal["V4_QUALITY_48", "V4_DEFAULT_20", "V4_TURBO_12"]
+    sampler_preset: Literal["V4_QUALITY_48", "V4_DEFAULT_20", "V4_TURBO_12"] | None = None
     structured_caption: dict[str, Any] | None = None
     prompt: str | None = Field(default=None, min_length=1, max_length=4000)
     magic_prompt: bool = False
 
     @model_validator(mode="after")
-    def validate_caption_mode(self) -> "GenerationRequest":
+    def validate_caption_mode(self) -> GenerationRequest:
+        if self.model == FLUX_2_KLEIN_4B:
+            if (
+                self.prompt is None
+                or self.structured_caption is not None
+                or self.magic_prompt
+                or self.sampler_preset is not None
+            ):
+                raise ValueError("FLUX.2 Klein requires a direct plain prompt")
+            return self
+        if self.sampler_preset is None:
+            raise ValueError("Ideogram generation requires a sampler_preset")
         if (self.structured_caption is None) == (self.prompt is None):
             raise ValueError("provide exactly one caption mode")
         if self.structured_caption is not None:
@@ -148,7 +161,7 @@ def _bytes(output: object) -> bytes:
 
 
 def _generation_status(status: dict[str, object]) -> dict[str, object]:
-    required_models = ("ideogram-4-nf4", *LONGCAT_MODELS)
+    required_models = ("ideogram-4-nf4", FLUX_2_KLEIN_4B, *LONGCAT_MODELS)
     raw_models = status.get("models")
     model_weights = {
         model: type(raw_models.get(model, {}).get("weightsAvailable")) is bool
@@ -319,6 +332,13 @@ def create_app(
                 ]
                 + [
                     {
+                        "capability": "generation",
+                        "model": FLUX_2_KLEIN_4B,
+                        "acceptsSourceImage": False,
+                    }
+                ]
+                + [
+                    {
                         "capability": "image-editing",
                         "model": model,
                         "acceptsSourceImage": True,
@@ -430,18 +450,18 @@ def create_app(
 
     @app.post("/v1/generations", response_class=Response)
     def generation(body: GenerationRequest) -> Response:
-        if body.prompt is not None and settings.magic_prompt_backend is None:
+        if (
+            body.model != FLUX_2_KLEIN_4B
+            and body.prompt is not None
+            and settings.magic_prompt_backend is None
+        ):
             raise HTTPException(422, "plain prompt expansion is not configured")
         generation = _generation_status(workers.health().get("generation", {}))
         model_matrix = cast(dict[str, dict[str, bool]], generation["models"])
-        if not model_matrix["ideogram-4-nf4"]["ready"]:
+        if not model_matrix[body.model]["ready"]:
             raise WorkerUnavailable("generation capability is unavailable")
         encoded = _bytes(
-            coordinator.run(
-                lambda: workers.generation(
-                    body.model_dump(exclude_none=True) | {"model": "ideogram-4-nf4"}
-                )
-            )
+            coordinator.run(lambda: workers.generation(body.model_dump(exclude_none=True)))
         )
         validate_png_output(
             encoded,
@@ -455,7 +475,9 @@ def create_app(
     @app.post("/v1/image-edits", response_class=Response)
     async def image_edit(
         file: Annotated[UploadFile, File()],
-        model: Annotated[Literal["longcat-image-edit", "longcat-image-edit-turbo"], Form()],
+        model: Annotated[
+            Literal["longcat-image-edit", "longcat-image-edit-turbo", "flux-2-klein-4b"], Form()
+        ],
         prompt: Annotated[str, Form(min_length=1, max_length=4000)],
         seed: Annotated[int, Form(ge=0, le=2**32 - 1)],
         negative_prompt: Annotated[str, Form(max_length=4000)] = "",

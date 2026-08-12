@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import sys
 import types
+from io import BytesIO
 from types import SimpleNamespace
 
 from helpers import png
-from spawn_adapters import build_adapters, settings as spawn_settings
 from PIL import Image
+from spawn_adapters import build_adapters
+from spawn_adapters import settings as spawn_settings
 
 from image_api_workers.generation_models import (
+    Flux2KleinModel,
     GenerationAdapterSettings,
     GenerationModels,
     LongCatImageEditModel,
@@ -47,6 +50,49 @@ class FakeIdeogram:
     def unload(self) -> None:
         self.loaded = False
         self.events.append("unload-ideogram")
+
+
+class FluxPipeline:
+    def __init__(self, events: list[object]) -> None:
+        self.events = events
+
+    def enable_model_cpu_offload(self) -> None:
+        self.events.append("offload")
+
+    def remove_all_hooks(self) -> None:
+        self.events.append("hooks")
+
+    def __call__(self, **parameters: object):
+        self.events.append(parameters)
+        return SimpleNamespace(images=[Image.new("RGBA", (13, 7))])
+
+
+def test_flux_2_klein_forwards_exact_prompt_and_source_as_rgb(tmp_path) -> None:
+    events: list[object] = []
+    adapter = Flux2KleinModel(
+        tmp_path,
+        pipeline_factory=lambda _path: FluxPipeline(events),
+        generator_factory=lambda seed: ("cuda", seed),
+        cuda_available=lambda: True,
+    )
+    output = adapter(
+        {
+            "model": "flux-2-klein-4b",
+            "source_image_bytes": png("RGBA", (13, 7)),
+            "prompt": "exact edit prompt",
+            "seed": 43,
+        }
+    )
+
+    call = next(event for event in events if isinstance(event, dict))
+    assert call["prompt"] == "exact edit prompt"
+    assert call["generator"] == ("cuda", 43)
+    assert isinstance(call["image"], Image.Image)
+    assert call["image"].mode == "RGB"
+    with Image.open(BytesIO(output)) as image:
+        assert image.mode == "RGB"
+    adapter.unload()
+    assert events[-1] == "hooks"
 
 
 def test_longcat_uses_official_defaults_and_releases_on_model_switch(tmp_path) -> None:
@@ -119,6 +165,45 @@ def test_generation_model_switch_unloads_longcat_before_ideogram(tmp_path) -> No
     models.unload()
 
 
+def test_generation_model_switch_reaps_flux_before_longcat() -> None:
+    lifecycle: list[tuple[str, str, int]] = []
+    models = GenerationModels(
+        spawn_settings(),
+        adapter_factory=build_adapters,
+        lifecycle_observer=lambda event, model, live_children: lifecycle.append(
+            (event, model, live_children)
+        ),
+    )
+    models(
+        {
+            "model": "flux-2-klein-4b",
+            "width": 256,
+            "height": 256,
+            "prompt": "exact generation prompt",
+            "seed": 1,
+        }
+    )
+    models(
+        {
+            "model": "longcat-image-edit",
+            "source_image_bytes": png(),
+            "prompt": "edit",
+            "negative_prompt": "",
+            "seed": 1,
+        }
+    )
+    assert lifecycle[:6] == [
+        ("spawn", "flux-2-klein-4b", 1),
+        ("load", "flux-2-klein-4b", 1),
+        ("exit", "flux-2-klein-4b", 0),
+        ("reap", "flux-2-klein-4b", 0),
+        ("spawn", "longcat-image-edit", 1),
+        ("load", "longcat-image-edit", 1),
+    ]
+    assert max(live_children for _, _, live_children in lifecycle) == 1
+    models.unload()
+
+
 def test_generation_child_uses_spawn_after_parent_cuda_inspection(monkeypatch, tmp_path) -> None:
     """CUDA-sensitive construction happens in a fresh spawned interpreter, not a fork clone."""
     child_start_method = tmp_path / "child-start-method"
@@ -126,7 +211,7 @@ def test_generation_child_uses_spawn_after_parent_cuda_inspection(monkeypatch, t
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
     assert cuda.is_available() is True
     models = GenerationModels(
-        GenerationAdapterSettings(str(child_start_method), (), "", ()),
+        GenerationAdapterSettings(str(child_start_method), (), "", "", ()),
         adapter_factory=build_adapters,
     )
 

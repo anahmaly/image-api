@@ -8,8 +8,17 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response
 
-from image_api.config import Settings, ideogram_weights_available, longcat_weights_available
-from image_api_workers.generation_models import GenerationAdapterSettings, GenerationModels
+from image_api.config import (
+    Settings,
+    flux_2_klein_weights_available,
+    ideogram_weights_available,
+    longcat_weights_available,
+)
+from image_api_workers.generation_models import (
+    FLUX_2_KLEIN_4B,
+    GenerationAdapterSettings,
+    GenerationModels,
+)
 
 logging.basicConfig(level=os.getenv("IMAGE_API_LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -36,6 +45,9 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
             ),
             "longcat-image-edit-turbo": longcat_weights_available(
                 settings.longcat_edit_turbo_weights_path, settings.longcat_edit_turbo_revision
+            ),
+            FLUX_2_KLEIN_4B: flux_2_klein_weights_available(
+                settings.flux_2_klein_4b_weights_path, settings.flux_2_klein_4b_revision
             ),
         }
         active_model = models.loaded_model if models.child_alive else None
@@ -104,6 +116,7 @@ def main() -> None:
                 ("longcat-image-edit", str(settings.longcat_edit_weights_path)),
                 ("longcat-image-edit-turbo", str(settings.longcat_edit_turbo_weights_path)),
             ),
+            flux_2_klein_4b_weights_path=str(settings.flux_2_klein_4b_weights_path),
             source_dir=str(Path("/tmp")),
             revisions=(
                 ("longcat-image-edit", settings.longcat_edit_revision),
