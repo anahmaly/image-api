@@ -1,12 +1,29 @@
 from __future__ import annotations
 
 import warnings
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BytesIO
-from math import isfinite
 from typing import IO
 
 from PIL import Image, UnidentifiedImageError
+
+
+_image_decode_lock = threading.RLock()
+
+
+@contextmanager
+def _output_decode_without_dimension_limit() -> Iterator[None]:
+    """Decode a worker artifact without imposing gateway dimension policy."""
+    with _image_decode_lock:
+        previous_limit = Image.MAX_IMAGE_PIXELS
+        try:
+            Image.MAX_IMAGE_PIXELS = None
+            yield
+        finally:
+            Image.MAX_IMAGE_PIXELS = previous_limit
 
 
 class InvalidImage(ValueError):
@@ -51,12 +68,6 @@ def validate_dimensions(
         raise ImageTooLarge("decoded image exceeds configured limit")
 
 
-def processing_output_size(info: ImageInfo, outscale: float) -> tuple[int, int]:
-    if not isfinite(outscale) or not 1 <= outscale <= 4:
-        raise ValueError("outscale must be between one and four")
-    return (round(info.width * outscale), round(info.height * outscale))
-
-
 def validate_image(
     data: bytes | IO[bytes],
     *,
@@ -87,7 +98,7 @@ def validate_image(
         if size > max_bytes:
             raise ImageTooLarge("encoded image exceeds configured limit")
     try:
-        with warnings.catch_warnings():
+        with _image_decode_lock, warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(stream) as image:
                 width, height = image.size
@@ -119,35 +130,39 @@ def validate_image(
 def validate_png_output(
     data: bytes | IO[bytes],
     *,
-    expected_size: tuple[int, int] | None,
     required_mode: str | None,
     max_bytes: int,
-    max_pixels: int,
-    max_decoded_bytes: int | None = None,
 ) -> None:
-    maximum_size = expected_size or (max_pixels, max_pixels)
-    info = validate_image(
-        data,
-        max_bytes=max_bytes,
-        max_width=maximum_size[0],
-        max_height=maximum_size[1],
-        max_pixels=max_pixels,
-        max_decoded_bytes=max_decoded_bytes,
-        worker_output=True,
-    )
     stream = BytesIO(data) if isinstance(data, bytes) else data
     position = stream.tell()
     try:
         stream.seek(0)
-        with Image.open(stream) as image:
+        if isinstance(data, bytes) and not data:
+            raise InvalidWorkerImage("image is empty")
+        if isinstance(data, bytes) and len(data) > max_bytes:
+            raise ImageTooLarge("encoded image exceeds configured limit")
+        if not isinstance(data, bytes):
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(0)
+            if size < 1:
+                raise InvalidWorkerImage("image is empty")
+            if size > max_bytes:
+                raise ImageTooLarge("encoded image exceeds configured limit")
+        with _output_decode_without_dimension_limit(), Image.open(stream) as image:
             image_format = image.format
+            image.verify()
+        stream.seek(0)
+        with _output_decode_without_dimension_limit(), Image.open(stream) as image:
+            image.load()
+            mode = image.mode
     except Exception as exc:
+        if isinstance(exc, (ImageTooLarge, InvalidWorkerImage)):
+            raise
         raise InvalidWorkerImage("worker output is invalid") from exc
     finally:
         stream.seek(position)
-    if image_format != "PNG" or (
-        expected_size is not None and (info.width, info.height) != expected_size
-    ):
+    if image_format != "PNG":
         raise InvalidWorkerImage("worker output contract mismatch")
-    if required_mode is not None and info.mode != required_mode:
+    if required_mode is not None and mode != required_mode:
         raise InvalidWorkerImage("worker output mode mismatch")

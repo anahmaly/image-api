@@ -202,8 +202,6 @@ class LongCatImageEditModel:
                     generator=self._generator(seed),
                 )
                 output_image = result.images[0].convert("RGB")
-                if output_image.size != source_image.size:
-                    output_image = output_image.resize(source_image.size)
             except Exception as exc:
                 logger.error(
                     "LongCat inference failed: model=%s",

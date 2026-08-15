@@ -3,12 +3,14 @@ from __future__ import annotations
 import multiprocessing
 import threading
 from collections.abc import Callable
+from io import BytesIO
 
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from helpers import png
 from spawn_adapters import build_adapters, settings as spawn_settings
@@ -16,7 +18,7 @@ from image_api.app import create_app
 from image_api.config import Settings
 from image_api.coordinator import SingleFlightCoordinator
 from image_api.workers import FakeWorkerClient, HttpWorkerClient, WorkerUnavailable
-from image_api_workers import background, upscale
+from image_api_workers import background, generation_worker, upscale
 from image_api_workers.generation_models import GenerationModels
 from image_api_workers.generation_worker import create_worker_app
 
@@ -73,6 +75,118 @@ def test_all_direct_capabilities_return_existing_synchronous_responses(tmp_path)
         .startswith("image/png")
     )
     assert worker.model_invocations == 3
+
+
+def test_public_routes_pass_through_model_png_bytes_and_produced_dimensions(tmp_path) -> None:
+    class ProducedOutputWorker(FakeWorkerClient):
+        output: bytes
+
+        def upscale(self, data, **parameters):
+            self.model_invocations += 1
+            return self.output
+
+        def background(self, data, **parameters):
+            self.model_invocations += 1
+            return self.output
+
+        def generation(self, request):
+            self.model_invocations += 1
+            return self.output
+
+        def image_edit(self, data, **parameters):
+            self.model_invocations += 1
+            return self.output
+
+    worker = ProducedOutputWorker()
+    client = TestClient(create_app(settings=Settings.for_tests(tmp_path), workers=worker))
+    source = {"file": ("input.png", png("RGB", (13, 7)), "image/png")}
+    routes = [
+        (
+            "RGB",
+            (19, 11),
+            "/v1/upscale?model=RealESRGAN_x4plus&outscale=2&tile=0",
+            {"files": source},
+        ),
+        (
+            "RGB",
+            (23, 9),
+            "/v1/upscale?model=RealESRGAN_x4plus_anime_6B&outscale=2&tile=0",
+            {"files": source},
+        ),
+        ("RGBA", (17, 13), "/v1/background-removal?model=bria-rmbg-2.0", {"files": source}),
+        (
+            "RGBA",
+            (21, 5),
+            "/v1/background-removal?model=birefnet-hr-matting",
+            {"files": source},
+        ),
+        (
+            "RGB",
+            (257, 255),
+            "/v1/generations",
+            {
+                "json": {
+                    "width": 256,
+                    "height": 256,
+                    "seed": 1,
+                    "sampler_preset": "V4_TURBO_12",
+                    "structured_caption": {"description": "bee"},
+                }
+            },
+        ),
+        (
+            "RGB",
+            (255, 257),
+            "/v1/generations",
+            {
+                "json": {
+                    "model": "flux-2-klein-4b",
+                    "width": 256,
+                    "height": 256,
+                    "seed": 1,
+                    "prompt": "bee",
+                    "magic_prompt": False,
+                }
+            },
+        ),
+        (
+            "RGB",
+            (15, 11),
+            "/v1/image-edits",
+            {
+                "data": {"model": "longcat-image-edit", "prompt": "bee", "seed": "1"},
+                "files": source,
+            },
+        ),
+        (
+            "RGB",
+            (11, 15),
+            "/v1/image-edits",
+            {
+                "data": {"model": "longcat-image-edit-turbo", "prompt": "bee", "seed": "1"},
+                "files": source,
+            },
+        ),
+        (
+            "RGB",
+            (17, 9),
+            "/v1/image-edits",
+            {
+                "data": {"model": "flux-2-klein-4b", "prompt": "bee", "seed": "1"},
+                "files": source,
+            },
+        ),
+    ]
+
+    for mode, size, route, kwargs in routes:
+        worker.output = png(mode, size)
+        response = client.post(route, **kwargs)
+        assert response.status_code == 200
+        assert response.content == worker.output
+        with Image.open(BytesIO(response.content)) as image:
+            assert image.format == "PNG"
+            assert image.mode == mode
+            assert image.size == size
 
 
 def test_worker_unavailability_is_retryable_without_replay(tmp_path) -> None:
@@ -221,6 +335,119 @@ def test_upscale_peer_eviction_failure_is_retryable_and_skips_local_model(
     assert invoked is False
 
 
+def test_generation_evicts_resident_background_before_loading_flux_and_reuses_flux(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    events: list[str] = []
+
+    class Models:
+        loaded_model: str | None = None
+
+        def __call__(self, request: dict[str, object]) -> bytes:
+            assert self.loaded_model is None or self.loaded_model == request["model"]
+            if self.loaded_model is None:
+                events.append(f"load-{request['model']}")
+            self.loaded_model = str(request["model"])
+            events.append(f"run-{request['model']}")
+            return png("RGB", (768, 1120))
+
+        def unload(self) -> None:
+            events.append("generation-unload")
+            self.loaded_model = None
+
+    models = Models()
+    monkeypatch.setattr(
+        generation_worker, "_evict_peers", lambda: events.append("background-unload")
+    )
+    worker = TestClient(create_worker_app(models, Settings.for_tests(tmp_path)))  # type: ignore[arg-type]
+    payload = {"prompt": "edit", "seed": "7"}
+    source = {"file": ("source.png", png("RGB", (768, 1123)), "image/png")}
+
+    assert (
+        worker.post(
+            "/internal/image-edit?model=flux-2-klein-4b", data=payload, files=source
+        ).status_code
+        == 200
+    )
+    assert (
+        worker.post(
+            "/internal/image-edit?model=flux-2-klein-4b", data=payload, files=source
+        ).status_code
+        == 200
+    )
+    assert events == [
+        "background-unload",
+        "load-flux-2-klein-4b",
+        "run-flux-2-klein-4b",
+        "run-flux-2-klein-4b",
+    ]
+
+
+def test_public_flux_edit_preserves_mismatched_worker_png_bytes_and_dimensions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    flux_png = png("RGB", (768, 1120))
+
+    class FluxModels:
+        loaded_model: str | None = None
+
+        def __call__(self, request: dict[str, object]) -> bytes:
+            self.loaded_model = str(request["model"])
+            return flux_png
+
+        def unload(self) -> None:
+            self.loaded_model = None
+
+    monkeypatch.setattr(generation_worker, "_evict_peers", lambda: None)
+    generation = TestClient(create_worker_app(FluxModels(), Settings.for_tests(tmp_path)))  # type: ignore[arg-type]
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(
+                200,
+                json={
+                    "ready": True,
+                    "loaded": False,
+                    "weightsAvailable": True,
+                    "device": "cpu-test",
+                    "models": {"flux-2-klein-4b": {"weightsAvailable": True}},
+                },
+                request=request,
+            )
+        response = generation.request(
+            request.method,
+            request.url.raw_path.decode(),
+            content=request.content,
+            headers={"content-type": request.headers.get("content-type", "")},
+        )
+        return httpx.Response(
+            response.status_code,
+            content=response.content,
+            headers=response.headers,
+            request=request,
+        )
+
+    workers = HttpWorkerClient(
+        "http://upscale",
+        "http://background",
+        1,
+        1_000_000,
+        httpx.MockTransport(transport),
+        "http://generation",
+    )
+    gateway = TestClient(create_app(settings=Settings.for_tests(tmp_path), workers=workers))
+    response = gateway.post(
+        "/v1/image-edits",
+        data={"model": "flux-2-klein-4b", "prompt": "edit", "seed": "7"},
+        files={"file": ("source.png", png("RGB", (768, 1123)), "image/png")},
+    )
+
+    assert response.status_code == 200
+    assert response.content == flux_png
+    with Image.open(BytesIO(response.content)) as image:
+        assert image.size == (768, 1120)
+
+
 def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_contention(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -324,6 +551,7 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
     monkeypatch.setattr(upscale, "_run", held_upscale)
     monkeypatch.setattr(background, "_run_background", fake_background)
     monkeypatch.setattr(background, "PeerEvictor", lambda _: lambda: None)
+    monkeypatch.setattr(generation_worker, "_evict_peers", lambda: None)
 
     clients = {
         "upscale": upscale_app,

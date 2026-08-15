@@ -247,29 +247,15 @@ def _release_resident_models() -> None:
             raise RuntimeError("background model release failed") from release_errors[0]
 
 
-def _validate_worker_dimensions(width: int, height: int, *, output: bool) -> None:
-    suffix = "OUTPUT" if output else "INPUT"
+def _validate_worker_dimensions(width: int, height: int) -> None:
     validate_dimensions(
         width,
         height,
         max_width=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_WIDTH", "8192")),
         max_height=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT", "8192")),
-        max_pixels=int(os.getenv(f"IMAGE_API_PROCESSING_MAX_{suffix}_PIXELS", "67108864")),
+        max_pixels=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_PIXELS", "67108864")),
         max_decoded_bytes=int(
-            os.getenv(f"IMAGE_API_PROCESSING_MAX_DECODED_{suffix}_BYTES", "268435456")
-        ),
-    )
-
-
-def _birefnet_output_limits() -> Any:
-    from rembg_api.limits import ImageLimits
-
-    return ImageLimits(
-        max_width=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_WIDTH", "8192")),
-        max_height=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT", "8192")),
-        max_pixels=int(os.getenv("IMAGE_API_PROCESSING_MAX_OUTPUT_PIXELS", "67108864")),
-        max_encoded_bytes=int(
-            os.getenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "300000000")
+            os.getenv("IMAGE_API_PROCESSING_MAX_DECODED_INPUT_BYTES", "268435456")
         ),
     )
 
@@ -301,8 +287,7 @@ def _run_background(
         raise ValueError("invalid BiRefNet inference size")
     with Image.open(io.BytesIO(data)) as source_image:
         expected_size = source_image.size
-        _validate_worker_dimensions(*expected_size, output=False)
-        _validate_worker_dimensions(*expected_size, output=True)
+        _validate_worker_dimensions(*expected_size)
         source_image.verify()
     if _active_model is not None and _active_model != model:
         _release_resident_models()
@@ -314,7 +299,6 @@ def _run_background(
             inference_size=birefnet_inference_size,
             foreground_refinement=birefnet_foreground_refinement,
             config=_birefnet_config(),
-            output_limits=_birefnet_output_limits(),
         )
     elif model == "bria-rmbg-2.0":
         from rembg_api.bria_rmbg import remove_with_bria_rmbg_2
@@ -390,8 +374,6 @@ def _run_background(
         output.load()
         if output.mode != "RGBA":
             raise RuntimeError("background backend did not return RGBA")
-        if output.size != expected_size:
-            raise RuntimeError("background backend returned unexpected dimensions")
     _active_model = model
     return encoded
 

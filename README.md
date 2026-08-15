@@ -20,6 +20,12 @@ No request, input, output, task, queue, or status is persisted. Restarting the g
 - `POST /v1/image-edits` — synchronous multipart RGB PNG edit.
 - `POST /v1/models/unload` — single-flight worker unload.
 
+Heavy models are globally single-resident: changing the selected model unloads the resident
+model before replacement loading begins, while reusing the same loaded model does not cycle it.
+Every valid model PNG response passes through with its produced bytes and dimensions unchanged.
+The gateway retains non-dimension output validation: PNG encoding, required pixel mode, complete
+decoding, and encoded transport byte ceilings. Callers own any optional dimension policy.
+
 The gateway is the only Compose service that publishes a host port. Worker controls are internal.
 
 ## Request and snapshot bounds

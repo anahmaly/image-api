@@ -25,7 +25,7 @@ from image_api.config import (
     longcat_weights_available,
 )
 from image_api.workers import FakeWorkerClient, HttpWorkerClient
-from image_api_workers import upscale
+from image_api_workers import generation_worker, upscale
 from image_api_workers.generation_models import GenerationModels
 from image_api_workers.generation_worker import create_worker_app
 
@@ -497,6 +497,7 @@ def test_worker_readiness_matrix_reaches_gateway_and_blocks_unavailable_selectio
             (event, model, live_children)
         ),
     )
+    monkeypatch.setattr(generation_worker, "_evict_peers", lambda: None)
     generation = TestClient(create_worker_app(models, settings))
     dispatches: list[str] = []
 

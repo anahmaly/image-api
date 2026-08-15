@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 
-from image_api.images import ImageTooLarge, validate_dimensions, validate_png_output
+from image_api.images import ImageTooLarge, validate_dimensions
 from image_api.workers import PeerEvictor, WorkerUnavailable
 from image_api_workers.execution import execute_in_gpu_lane
 from image_api_workers.uploads import read_bounded_upload
@@ -139,16 +139,6 @@ def _run(data: bytes, model: str, outscale: float, tile: int) -> bytes:
     if not ok:
         raise RuntimeError("PNG encoding failed")
     output = bytes(encoded)
-    validate_png_output(
-        output,
-        expected_size=(round(width * outscale), round(height * outscale)),
-        required_mode="RGB",
-        max_bytes=int(os.getenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "300000000")),
-        max_pixels=int(os.getenv("IMAGE_API_PROCESSING_MAX_OUTPUT_PIXELS", "67108864")),
-        max_decoded_bytes=int(
-            os.getenv("IMAGE_API_PROCESSING_MAX_DECODED_OUTPUT_BYTES", "268435456")
-        ),
-    )
     return output
 
 

@@ -19,9 +19,26 @@ from image_api_workers.generation_models import (
     GenerationAdapterSettings,
     GenerationModels,
 )
+from image_api.workers import PeerEvictor, WorkerUnavailable
 
 logging.basicConfig(level=os.getenv("IMAGE_API_LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
+
+
+def _evict_peers() -> None:
+    PeerEvictor(
+        (
+            os.getenv("IMAGE_API_UPSCALE_WORKER_URL", "http://upscale-worker:9001"),
+            os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
+        )
+    )()
+
+
+def _run_selected_model(models: GenerationModels, request: dict[str, object]) -> bytes:
+    target = request.get("model")
+    if isinstance(target, str) and models.loaded_model != target:
+        _evict_peers()
+    return models(request)
 
 
 def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
@@ -71,7 +88,9 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
     @app.post("/internal/generate")
     def generate(request: dict[str, object]) -> Response:
         try:
-            return Response(models(request), media_type="image/png")
+            return Response(_run_selected_model(models, request), media_type="image/png")
+        except WorkerUnavailable as exc:
+            raise HTTPException(503, "peer model eviction unavailable") from exc
         except Exception as exc:
             logger.exception("generation worker failed")
             raise HTTPException(500, "internal generation error") from exc
@@ -87,17 +106,20 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
         try:
             data = await file.read()
             return Response(
-                models(
+                _run_selected_model(
+                    models,
                     {
                         "model": model,
                         "prompt": prompt,
                         "negative_prompt": negative_prompt,
                         "seed": seed,
                         "source_image_bytes": data,
-                    }
+                    },
                 ),
                 media_type="image/png",
             )
+        except WorkerUnavailable as exc:
+            raise HTTPException(503, "peer model eviction unavailable") from exc
         except Exception as exc:
             logger.exception("image edit worker failed")
             raise HTTPException(500, "internal generation error") from exc
