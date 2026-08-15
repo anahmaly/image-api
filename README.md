@@ -20,6 +20,11 @@ No request, input, output, task, queue, or status is persisted. Restarting the g
 - `POST /v1/image-edits` — synchronous multipart RGB PNG edit.
 - `POST /v1/models/unload` — single-flight worker unload.
 
+Heavy models are globally single-resident: changing the selected model unloads the resident
+model before replacement loading begins, while reusing the same loaded model does not cycle it.
+LongCat edits remain normalized to source dimensions. Valid FLUX edit PNG bytes and dimensions
+pass through unchanged; the gateway retains all other PNG validation.
+
 The gateway is the only Compose service that publishes a host port. Worker controls are internal.
 
 ## Request and snapshot bounds

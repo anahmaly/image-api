@@ -504,7 +504,7 @@ def create_app(
         )
         validate_png_output(
             encoded,
-            expected_size=(info.width, info.height),
+            expected_size=None if model == FLUX_2_KLEIN_4B else (info.width, info.height),
             required_mode="RGB",
             max_bytes=100_000_000,
             max_pixels=info.width * info.height,
