@@ -15,7 +15,6 @@ from image_api.images import (
     ImageTooLarge,
     InvalidImage,
     InvalidWorkerImage,
-    processing_output_size,
     validate_image,
     validate_png_output,
 )
@@ -375,7 +374,6 @@ def create_app(
             max_pixels=settings.processing_max_input_pixels,
             max_decoded_bytes=settings.processing_max_decoded_input_bytes,
         )
-        expected = processing_output_size(info, outscale)
         settings.admit_upscale_processing(info.width, info.height)
         encoded = _bytes(
             coordinator.run(
@@ -384,11 +382,8 @@ def create_app(
         )
         validate_png_output(
             encoded,
-            expected_size=expected,
             required_mode="RGB",
             max_bytes=settings.processing_max_encoded_output_bytes,
-            max_pixels=settings.processing_max_output_pixels,
-            max_decoded_bytes=settings.processing_max_decoded_output_bytes,
         )
         return Response(encoded, media_type="image/png")
 
@@ -412,7 +407,7 @@ def create_app(
         boundary_alpha_gamma: Annotated[float, Query(ge=0.1, le=4)] = 0.6,
     ) -> Response:
         data = await _read_upload(file, settings.processing_max_upload_bytes)
-        info = validate_image(
+        validate_image(
             data,
             max_bytes=settings.processing_max_upload_bytes,
             max_width=settings.processing_max_input_width,
@@ -440,11 +435,8 @@ def create_app(
         encoded = _bytes(coordinator.run(lambda: workers.background(data, **params)))
         validate_png_output(
             encoded,
-            expected_size=(info.width, info.height),
             required_mode="RGBA",
             max_bytes=settings.processing_max_encoded_output_bytes,
-            max_pixels=settings.processing_max_output_pixels,
-            max_decoded_bytes=settings.processing_max_decoded_output_bytes,
         )
         return Response(encoded, media_type="image/png")
 
@@ -465,10 +457,8 @@ def create_app(
         )
         validate_png_output(
             encoded,
-            expected_size=(body.width, body.height),
             required_mode="RGB",
             max_bytes=100_000_000,
-            max_pixels=body.width * body.height,
         )
         return Response(encoded, media_type="image/png")
 
@@ -487,7 +477,7 @@ def create_app(
         if not model_matrix[model]["ready"]:
             raise WorkerUnavailable("selected image-edit model is unavailable")
         data = await _read_upload(file, settings.max_upload_bytes)
-        info = validate_image(
+        validate_image(
             data,
             max_bytes=settings.max_upload_bytes,
             max_width=settings.max_input_width,
@@ -504,10 +494,8 @@ def create_app(
         )
         validate_png_output(
             encoded,
-            expected_size=None if model == FLUX_2_KLEIN_4B else (info.width, info.height),
             required_mode="RGB",
             max_bytes=100_000_000,
-            max_pixels=info.width * info.height,
         )
         return Response(encoded, media_type="image/png")
 

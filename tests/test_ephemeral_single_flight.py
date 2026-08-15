@@ -77,6 +77,118 @@ def test_all_direct_capabilities_return_existing_synchronous_responses(tmp_path)
     assert worker.model_invocations == 3
 
 
+def test_public_routes_pass_through_model_png_bytes_and_produced_dimensions(tmp_path) -> None:
+    class ProducedOutputWorker(FakeWorkerClient):
+        output: bytes
+
+        def upscale(self, data, **parameters):
+            self.model_invocations += 1
+            return self.output
+
+        def background(self, data, **parameters):
+            self.model_invocations += 1
+            return self.output
+
+        def generation(self, request):
+            self.model_invocations += 1
+            return self.output
+
+        def image_edit(self, data, **parameters):
+            self.model_invocations += 1
+            return self.output
+
+    worker = ProducedOutputWorker()
+    client = TestClient(create_app(settings=Settings.for_tests(tmp_path), workers=worker))
+    source = {"file": ("input.png", png("RGB", (13, 7)), "image/png")}
+    routes = [
+        (
+            "RGB",
+            (19, 11),
+            "/v1/upscale?model=RealESRGAN_x4plus&outscale=2&tile=0",
+            {"files": source},
+        ),
+        (
+            "RGB",
+            (23, 9),
+            "/v1/upscale?model=RealESRGAN_x4plus_anime_6B&outscale=2&tile=0",
+            {"files": source},
+        ),
+        ("RGBA", (17, 13), "/v1/background-removal?model=bria-rmbg-2.0", {"files": source}),
+        (
+            "RGBA",
+            (21, 5),
+            "/v1/background-removal?model=birefnet-hr-matting",
+            {"files": source},
+        ),
+        (
+            "RGB",
+            (257, 255),
+            "/v1/generations",
+            {
+                "json": {
+                    "width": 256,
+                    "height": 256,
+                    "seed": 1,
+                    "sampler_preset": "V4_TURBO_12",
+                    "structured_caption": {"description": "bee"},
+                }
+            },
+        ),
+        (
+            "RGB",
+            (255, 257),
+            "/v1/generations",
+            {
+                "json": {
+                    "model": "flux-2-klein-4b",
+                    "width": 256,
+                    "height": 256,
+                    "seed": 1,
+                    "prompt": "bee",
+                    "magic_prompt": False,
+                }
+            },
+        ),
+        (
+            "RGB",
+            (15, 11),
+            "/v1/image-edits",
+            {
+                "data": {"model": "longcat-image-edit", "prompt": "bee", "seed": "1"},
+                "files": source,
+            },
+        ),
+        (
+            "RGB",
+            (11, 15),
+            "/v1/image-edits",
+            {
+                "data": {"model": "longcat-image-edit-turbo", "prompt": "bee", "seed": "1"},
+                "files": source,
+            },
+        ),
+        (
+            "RGB",
+            (17, 9),
+            "/v1/image-edits",
+            {
+                "data": {"model": "flux-2-klein-4b", "prompt": "bee", "seed": "1"},
+                "files": source,
+            },
+        ),
+    ]
+
+    for mode, size, route, kwargs in routes:
+        worker.output = png(mode, size)
+        response = client.post(route, **kwargs)
+        assert response.status_code == 200
+        assert response.content == worker.output
+        with Image.open(BytesIO(response.content)) as image:
+            assert image.format == "PNG"
+            assert image.mode == mode
+            assert image.size == size
+
+
 def test_worker_unavailability_is_retryable_without_replay(tmp_path) -> None:
     class UnavailableWorker(FakeWorkerClient):
         def generation(self, request: dict[str, object]) -> bytes:

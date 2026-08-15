@@ -48,7 +48,7 @@ def test_flux_2_klein_edit_preserves_source_and_exact_prompt(tmp_path) -> None:
     assert worker.model_invocations == 1
 
 
-def test_non_flux_image_edit_retains_source_dimension_validation(tmp_path) -> None:
+def test_non_flux_image_edit_passes_through_mismatched_worker_png(tmp_path) -> None:
     class MismatchedOutputWorker(FakeWorkerClient):
         def image_edit(self, data: WorkerInput, **parameters: object) -> WorkerOutput:
             self.model_invocations += 1
@@ -57,8 +57,10 @@ def test_non_flux_image_edit_retains_source_dimension_validation(tmp_path) -> No
     worker = MismatchedOutputWorker()
     client = TestClient(create_app(settings=Settings.for_tests(tmp_path), workers=worker))
     response = edit(client, model="longcat-image-edit")
-    assert response.status_code == 502
-    assert response.json()["error"]["code"] == "invalid_worker_output"
+    assert response.status_code == 200
+    assert response.content == png("RGB", (13, 6))
+    with Image.open(BytesIO(response.content)) as image:
+        assert image.size == (13, 6)
 
 
 def test_image_edit_validates_source_and_fields_before_dispatch(tmp_path) -> None:
