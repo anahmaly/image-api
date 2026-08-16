@@ -2,21 +2,20 @@ from __future__ import annotations
 
 import multiprocessing
 import threading
-from collections.abc import Callable
 from io import BytesIO
-
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from PIL import Image
-
 from helpers import png
-from spawn_adapters import build_adapters, settings as spawn_settings
+from PIL import Image
+from spawn_adapters import build_adapters
+from spawn_adapters import settings as spawn_settings
+
 from image_api.app import create_app
 from image_api.config import Settings
-from image_api.coordinator import SingleFlightCoordinator
+from image_api.coordinator import CoordinatorBusy, SingleFlightCoordinator
 from image_api.workers import FakeWorkerClient, HttpWorkerClient, WorkerUnavailable
 from image_api_workers import background, generation_worker, upscale
 from image_api_workers.generation_models import GenerationModels
@@ -28,20 +27,42 @@ def immediate_upscale_peer_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(upscale, "_evict_peers", lambda: None)
 
 
-def test_global_single_flight_rejects_reentrant_request_and_releases_slot(tmp_path) -> None:
+def test_global_single_flight_rejects_reentrant_work_waits_for_next_request_and_releases_slot(
+    tmp_path,
+) -> None:
     coordinator = SingleFlightCoordinator()
-    observed: list[int] = []
+    observed: list[str] = []
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
 
     def first() -> None:
         assert coordinator.status()["active"] == 1
-        observed.append(1)
+        observed.append("first")
         try:
             coordinator.run(lambda: None)
-        except Exception as exc:
-            observed.append(int(exc.__class__.__name__ == "CoordinatorBusy"))
+        except CoordinatorBusy:
+            observed.append("CoordinatorBusy")
+        first_entered.set()
+        release_first.wait()
 
-    coordinator.run(first)
-    assert observed == [1, 1]
+    def second() -> None:
+        second_started.set()
+        coordinator.run(lambda: observed.append("second"))
+
+    first_thread = threading.Thread(target=lambda: coordinator.run(first))
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    first_entered.wait()
+    second_thread.start()
+    second_started.wait()
+    assert observed == ["first", "CoordinatorBusy"]
+    assert coordinator.status()["active"] == 1
+    release_first.set()
+    first_thread.join()
+    second_thread.join()
+
+    assert observed == ["first", "CoordinatorBusy", "second"]
     assert coordinator.status() == {"ready": True, "active": 0, "capacity": 1}
     assert coordinator.run(lambda: "released") == "released"
 
@@ -523,7 +544,14 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
             self.model.unloads += 1
 
     boundary = ModelBoundary()
-    models = GenerationModels(spawn_settings(), adapter_factory=build_adapters)
+    lifecycle: list[tuple[str, str, int]] = []
+    models = GenerationModels(
+        spawn_settings(),
+        adapter_factory=build_adapters,
+        lifecycle_observer=lambda event, model, live_children: lifecycle.append(
+            (event, model, live_children)
+        ),
+    )
     generation = TestClient(create_worker_app(models, Settings.for_tests(tmp_path)))
     upscale_app = TestClient(upscale.app)
     background_app = TestClient(background.app)
@@ -546,11 +574,16 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
 
     def fake_background(data: bytes, **_: object) -> bytes:
         assert data == png()
+        lifecycle.append(("run", "birefnet-hr-matting", int(models.child_alive)))
         return png("RGBA")
+
+    def evict_background_peers() -> None:
+        assert upscale_app.post("/internal/unload").status_code == 200
+        assert generation.post("/internal/unload").status_code == 200
 
     monkeypatch.setattr(upscale, "_run", held_upscale)
     monkeypatch.setattr(background, "_run_background", fake_background)
-    monkeypatch.setattr(background, "PeerEvictor", lambda _: lambda: None)
+    monkeypatch.setattr(background, "PeerEvictor", lambda _: evict_background_peers)
     monkeypatch.setattr(generation_worker, "_evict_peers", lambda: None)
 
     clients = {
@@ -605,7 +638,7 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
     )
     source = {"file": ("input.png", png(), "image/png")}
 
-    held_result: list[object] = []
+    held_result: list[httpx.Response] = []
 
     def run_held_upscale() -> None:
         held_result.append(
@@ -626,48 +659,36 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
     assert b'name="file"' in dispatches[0][2]
     assert png() in dispatches[0][2]
 
-    busy_requests: tuple[Callable[[], object], ...] = (
-        lambda: gateway.post(
-            "/v1/generations",
-            json={
-                "width": 256,
-                "height": 256,
-                "seed": 7,
-                "sampler_preset": "V4_TURBO_12",
-                "structured_caption": {"description": "generation"},
-            },
-        ),
-        lambda: gateway.post(
-            "/v1/image-edits",
-            files=source,
-            data={"model": "longcat-image-edit", "prompt": "edit", "seed": "9"},
-        ),
-        lambda: gateway.post("/v1/background-removal?model=birefnet-hr-matting", files=source),
-        lambda: gateway.post("/v1/models/unload"),
-    )
-    for request in busy_requests:
-        response = request()
-        assert response.status_code == 503
-        assert response.json()["error"]["code"] == "image_capacity_busy"
+    waiting_result: list[httpx.Response] = []
+    waiting_started = threading.Event()
+
+    def run_waiting_generation() -> None:
+        waiting_started.set()
+        waiting_result.append(
+            gateway.post(
+                "/v1/generations",
+                json={
+                    "width": 256,
+                    "height": 256,
+                    "seed": 7,
+                    "sampler_preset": "V4_TURBO_12",
+                    "structured_caption": {"description": "generation"},
+                },
+            )
+        )
+
+    waiting = threading.Thread(target=run_waiting_generation)
+    waiting.start()
+    waiting_started.wait()
     assert len(dispatches) == 1
 
     boundary.release.set()
     held.join()
+    waiting.join()
     response = held_result[0]
-    assert getattr(response, "status_code") == 200
+    assert response.status_code == 200
+    assert waiting_result[0].status_code == 200
     assert max_active_models == 1
-
-    generation_response = gateway.post(
-        "/v1/generations",
-        json={
-            "width": 256,
-            "height": 256,
-            "seed": 7,
-            "sampler_preset": "V4_TURBO_12",
-            "structured_caption": {"description": "generation"},
-        },
-    )
-    assert generation_response.status_code == 200
     assert dispatches[-1][0:2] == ("generation", "/internal/generate")
 
     edit_response = gateway.post(
@@ -690,6 +711,18 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
         == unload_response.status_code
         == 200
     )
+    assert lifecycle == [
+        ("spawn", "ideogram-4-nf4", 1),
+        ("load", "ideogram-4-nf4", 1),
+        ("exit", "ideogram-4-nf4", 0),
+        ("reap", "ideogram-4-nf4", 0),
+        ("spawn", "longcat-image-edit", 1),
+        ("load", "longcat-image-edit", 1),
+        ("exit", "longcat-image-edit", 0),
+        ("reap", "longcat-image-edit", 0),
+        ("run", "birefnet-hr-matting", 0),
+    ]
+    assert max(live_children for _, _, live_children in lifecycle) == 1
     assert [item[1].split("?")[0] for item in dispatches] == [
         "/internal/upscale",
         "/internal/generate",

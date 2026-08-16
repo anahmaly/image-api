@@ -382,6 +382,7 @@ class GenerationModels:
         ] = build_production_adapters,
         status_path: Path | None = None,
         lifecycle_observer: Callable[[str, str, int], None] | None = None,
+        shutdown_timeout_seconds: float = 30.0,
     ) -> None:
         self._adapter_settings = adapter_settings
         self._adapter_factory = adapter_factory
@@ -391,6 +392,7 @@ class GenerationModels:
         self._child: Any | None = None
         self._channel: object | None = None
         self._lifecycle_observer = lifecycle_observer
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._write_status("unloaded")
 
     def _observe(self, event: str, model: str, live_children: int) -> None:
@@ -467,10 +469,12 @@ class GenerationModels:
                         channel.close()
                 except (BrokenPipeError, EOFError, OSError):
                     pass
-                child.join()
+                child.join(self._shutdown_timeout_seconds)
                 if child.is_alive():
                     child.terminate()
-                    child.join()
+                    child.join(self._shutdown_timeout_seconds)
+                if child.is_alive():
+                    raise RuntimeError("generation model child did not terminate")
                 if model is not None:
                     self._observe("exit", model, 0)
                     self._observe("reap", model, 0)

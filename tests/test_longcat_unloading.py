@@ -5,17 +5,20 @@ import types
 from io import BytesIO
 from types import SimpleNamespace
 
+from fastapi.testclient import TestClient
 from helpers import png
 from PIL import Image
 from spawn_adapters import build_adapters
 from spawn_adapters import settings as spawn_settings
 
+from image_api.config import Settings
 from image_api_workers.generation_models import (
     Flux2KleinModel,
     GenerationAdapterSettings,
     GenerationModels,
     LongCatImageEditModel,
 )
+from image_api_workers.generation_worker import create_worker_app
 
 
 class EditPipeline:
@@ -202,6 +205,76 @@ def test_generation_model_switch_reaps_flux_before_longcat() -> None:
     ]
     assert max(live_children for _, _, live_children in lifecycle) == 1
     models.unload()
+
+
+def test_generation_unload_refuses_success_while_a_child_remains_alive(tmp_path) -> None:
+    class UnreapedChild:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def join(self, timeout: float) -> None:
+            assert timeout == 30.0
+            self.events.append("join")
+
+        def terminate(self) -> None:
+            self.events.append("terminate")
+
+        def is_alive(self) -> bool:
+            return True
+
+    child = UnreapedChild()
+    models = GenerationModels(spawn_settings(), adapter_factory=build_adapters)
+    models._child = child
+    models.loaded_model = "flux-2-klein-4b"
+
+    response = TestClient(
+        create_worker_app(models, Settings.for_tests(tmp_path)), raise_server_exceptions=False
+    ).post("/internal/unload")
+
+    assert response.status_code == 500
+    assert child.events == ["join", "terminate", "join"]
+    assert models.child_alive is True
+    assert models.loaded_model == "flux-2-klein-4b"
+
+
+def test_generation_switch_does_not_spawn_the_target_when_old_child_cannot_be_reaped() -> None:
+    class UnreapedChild:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def join(self, timeout: float) -> None:
+            assert timeout == 30.0
+            self.events.append("join")
+
+        def terminate(self) -> None:
+            self.events.append("terminate")
+
+        def is_alive(self) -> bool:
+            return True
+
+    child = UnreapedChild()
+    models = GenerationModels(spawn_settings(), adapter_factory=build_adapters)
+    models._child = child
+    models.loaded_model = "flux-2-klein-4b"
+
+    try:
+        models(
+            {
+                "model": "longcat-image-edit",
+                "source_image_bytes": png(),
+                "prompt": "edit",
+                "negative_prompt": "",
+                "seed": 1,
+            }
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "generation model child did not terminate"
+    else:
+        raise AssertionError("target model loaded before the old child was reaped")
+
+    assert child.events == ["join", "terminate", "join"]
+    assert models.child_alive is True
+    assert models.loaded_model == "flux-2-klein-4b"
 
 
 def test_generation_child_uses_spawn_after_parent_cuda_inspection(monkeypatch, tmp_path) -> None:
