@@ -391,6 +391,7 @@ class GenerationModels:
         self._lock = threading.RLock()
         self._child: Any | None = None
         self._channel: object | None = None
+        self._child_model: str | None = None
         self._lifecycle_observer = lifecycle_observer
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._write_status("unloaded")
@@ -423,7 +424,7 @@ class GenerationModels:
         ):
             raise ValueError("invalid persisted generation model")
         with self._lock:
-            if self.loaded_model is not None and self.loaded_model != target:
+            if self._child is not None and self.loaded_model != target:
                 self.unload()
             self._write_status("loading")
             if self._child is None:
@@ -436,6 +437,7 @@ class GenerationModels:
                 )
                 self._child.start()
                 child.close()
+                self._child_model = str(target)
                 self._observe("spawn", str(target), 1)
             try:
                 from multiprocessing.connection import Connection
@@ -460,7 +462,7 @@ class GenerationModels:
             child = self._child
             channel = self._channel
             if child is not None:
-                model = self.loaded_model
+                model = self.loaded_model or self._child_model
                 try:
                     from multiprocessing.connection import Connection
 
@@ -480,5 +482,6 @@ class GenerationModels:
                     self._observe("reap", model, 0)
             self._child = None
             self._channel = None
+            self._child_model = None
             self.loaded_model = None
             self._write_status("unloaded")
