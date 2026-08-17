@@ -382,6 +382,7 @@ class GenerationModels:
         ] = build_production_adapters,
         status_path: Path | None = None,
         lifecycle_observer: Callable[[str, str, int], None] | None = None,
+        shutdown_timeout_seconds: float = 30.0,
     ) -> None:
         self._adapter_settings = adapter_settings
         self._adapter_factory = adapter_factory
@@ -390,7 +391,9 @@ class GenerationModels:
         self._lock = threading.RLock()
         self._child: Any | None = None
         self._channel: object | None = None
+        self._child_model: str | None = None
         self._lifecycle_observer = lifecycle_observer
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._write_status("unloaded")
 
     def _observe(self, event: str, model: str, live_children: int) -> None:
@@ -421,7 +424,7 @@ class GenerationModels:
         ):
             raise ValueError("invalid persisted generation model")
         with self._lock:
-            if self.loaded_model is not None and self.loaded_model != target:
+            if self._child is not None and self.loaded_model != target:
                 self.unload()
             self._write_status("loading")
             if self._child is None:
@@ -434,6 +437,7 @@ class GenerationModels:
                 )
                 self._child.start()
                 child.close()
+                self._child_model = str(target)
                 self._observe("spawn", str(target), 1)
             try:
                 from multiprocessing.connection import Connection
@@ -458,7 +462,7 @@ class GenerationModels:
             child = self._child
             channel = self._channel
             if child is not None:
-                model = self.loaded_model
+                model = self.loaded_model or self._child_model
                 try:
                     from multiprocessing.connection import Connection
 
@@ -467,14 +471,17 @@ class GenerationModels:
                         channel.close()
                 except (BrokenPipeError, EOFError, OSError):
                     pass
-                child.join()
+                child.join(self._shutdown_timeout_seconds)
                 if child.is_alive():
                     child.terminate()
-                    child.join()
+                    child.join(self._shutdown_timeout_seconds)
+                if child.is_alive():
+                    raise RuntimeError("generation model child did not terminate")
                 if model is not None:
                     self._observe("exit", model, 0)
                     self._observe("reap", model, 0)
             self._child = None
             self._channel = None
+            self._child_model = None
             self.loaded_model = None
             self._write_status("unloaded")
