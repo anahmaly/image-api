@@ -49,6 +49,26 @@ Upstream reference preprocessing (area limit and latent-grid alignment) remains
 in the pinned pipeline; produced PNG dimensions pass through unchanged. Both paths
 use 50 steps, guidance 4.0, one output and no caption upsampling.
 
+Both routes accept optional `vae_tiling`, defaulting to false. On
+`/v1/generations`, supply a JSON boolean (`"vae_tiling": true`); strings, numbers
+and null are rejected. On `/v1/image-edits`, supply the multipart text field
+`vae_tiling=true` or `vae_tiling=false` (only these lowercase literals).
+Enabling it for any model other than `flux-2-dev-bnb-4bit` is rejected with 422;
+omitting it or supplying false preserves existing model behavior.
+
+The option calls the native `AutoencoderKLFlux2.enable_tiling()` on the fresh
+request-owned CUDA VAE before use. It permits tiled reference-image encoding and
+output decoding above the upstream VAE's native thresholds; text-only requests
+use only decoding. It does not tile transformer diffusion: denoising still
+processes the full latent sequence on GPU. VAE tiling can reduce VAE activation
+memory, but does not guarantee that a request fits GPU memory. Tile blending can
+produce seams, numerical rounding and output differences; identical output is
+not promised. There are no custom tile controls or changes to dimension/budget
+limits. Each request releases its VAE on success or failure, so true cannot leak
+into subsequent false/omitted requests, including after worker unload/reload.
+Physical memory savings and output quality require separately authorized live
+validation; offline fake-boundary tests do not establish them.
+
 The only supported artifact is
 [`diffusers/FLUX.2-dev-bnb-4bit@c30ad107542e63f222f864a8de510204394fb18a`](https://huggingface.co/diffusers/FLUX.2-dev-bnb-4bit/tree/c30ad107542e63f222f864a8de510204394fb18a),
 with both official NF4 components. The checked-in

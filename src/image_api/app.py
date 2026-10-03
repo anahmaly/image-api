@@ -7,10 +7,11 @@ from typing import Annotated, Any, BinaryIO, Literal, cast
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StrictBool, model_validator
 
 from image_api.config import Settings
 from image_api.coordinator import CoordinatorBusy, SingleFlightCoordinator
+from image_api.generation_options import validate_vae_tiling
 from image_api.images import (
     ImageTooLarge,
     InvalidImage,
@@ -44,9 +45,11 @@ class GenerationRequest(BaseModel):
     structured_caption: dict[str, Any] | None = None
     prompt: str | None = Field(default=None, min_length=1, max_length=4000)
     magic_prompt: bool = False
+    vae_tiling: StrictBool = False
 
     @model_validator(mode="after")
     def validate_caption_mode(self) -> GenerationRequest:
+        validate_vae_tiling(self.model, self.vae_tiling)
         if self.model in FLUX_MODELS:
             if (
                 self.prompt is None
@@ -467,6 +470,7 @@ def create_app(
 
     @app.post("/v1/image-edits", response_class=Response)
     async def image_edit(
+        request: Request,
         file: Annotated[UploadFile, File()],
         model: Annotated[
             Literal[
@@ -480,7 +484,16 @@ def create_app(
         prompt: Annotated[str, Form(min_length=1, max_length=4000)],
         seed: Annotated[int, Form(ge=0, le=2**32 - 1)],
         negative_prompt: Annotated[str, Form(max_length=4000)] = "",
+        vae_tiling: Annotated[Literal["true", "false"], Form()] = "false",
     ) -> Response:
+        # FastAPI substitutes form defaults for empty strings; an explicitly
+        # empty option is invalid, not an omitted default-off request.
+        if (await request.form()).get("vae_tiling") == "":
+            raise HTTPException(422, "vae_tiling must be true or false")
+        try:
+            tiling = validate_vae_tiling(model, vae_tiling == "true")
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         if model == FLUX_2_DEV and negative_prompt:
             raise HTTPException(422, "FLUX.2 dev does not support negative prompts")
         generation = _generation_status(workers.health().get("generation", {}))
@@ -499,7 +512,12 @@ def create_app(
         encoded = _bytes(
             coordinator.run(
                 lambda: workers.image_edit(
-                    data, model=model, prompt=prompt, negative_prompt=negative_prompt, seed=seed
+                    data,
+                    model=model,
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    seed=seed,
+                    vae_tiling="true" if tiling else "false",
                 )
             )
         )

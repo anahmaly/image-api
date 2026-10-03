@@ -11,6 +11,7 @@ from typing import Any, cast
 from PIL import Image
 
 from image_api.config import flux_2_dev_weights_available
+from image_api.generation_options import validate_vae_tiling
 
 logger = logging.getLogger(__name__)
 FLUX_2_DEV = "flux-2-dev-bnb-4bit"
@@ -67,7 +68,9 @@ class Flux2DevModel:
             pipeline = encoder = None
             _release_cuda_memory()
 
-    def _generate(self, embeddings: Any, parameters: dict[str, Any]) -> Image.Image:
+    def _generate(
+        self, embeddings: Any, parameters: dict[str, Any], vae_tiling: bool
+    ) -> Image.Image:
         import torch
         from diffusers import AutoencoderKLFlux2, Flux2Pipeline, Flux2Transformer2DModel
 
@@ -84,6 +87,10 @@ class Flux2DevModel:
                 local_files_only=True,
                 torch_dtype=torch.bfloat16,
             ).to("cuda:0")
+            # This fresh request-owned VAE handles both reference encoding and
+            # output decoding. Transformer diffusion remains full-latent.
+            if vae_tiling:
+                vae.enable_tiling()
             pipeline = Flux2Pipeline.from_pretrained(
                 str(self.weights_path),
                 local_files_only=True,
@@ -116,6 +123,7 @@ class Flux2DevModel:
             prompt, seed = request.get("prompt"), request.get("seed")
             if request.get("model") != FLUX_2_DEV:
                 raise ValueError("invalid FLUX.2 dev model")
+            vae_tiling = validate_vae_tiling(FLUX_2_DEV, request.get("vae_tiling", False))
             if not isinstance(prompt, str) or not 1 <= len(prompt) <= 4000:
                 raise ValueError("invalid FLUX.2 dev prompt")
             if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
@@ -147,7 +155,7 @@ class Flux2DevModel:
             try:
                 embeddings = self._encode(prompt)
                 parameters["generator"] = torch.Generator(device="cuda:0").manual_seed(seed)
-                image = self._generate(embeddings, parameters)
+                image = self._generate(embeddings, parameters, vae_tiling)
             except Exception as exc:
                 logger.error("FLUX.2 dev generation failed", exc_info=exc)
                 traceback.clear_frames(exc.__traceback__)
