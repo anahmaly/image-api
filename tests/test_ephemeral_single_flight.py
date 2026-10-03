@@ -739,6 +739,7 @@ def test_public_routes_use_one_real_coordinator_and_internal_handlers_under_cont
         "prompt": ["edit"],
         "negative_prompt": ["none"],
         "seed": ["9"],
+        "vae_tiling": ["false"],
     }
     assert parse_qs(urlsplit(dispatches[3][1]).query) == {
         "model": ["birefnet-hr-matting"],
