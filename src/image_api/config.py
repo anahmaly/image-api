@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -12,6 +13,10 @@ SNAPSHOT_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 LONGCAT_EDIT_REVISION = "7b54ef423aa7854be7861600024be5c56ab7875a"
 LONGCAT_EDIT_TURBO_REVISION = "6a7262de5549f0bf0ec54c08ef7d283ef41f3214"
 FLUX_2_KLEIN_4B_REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
+FLUX_2_DEV_MANIFEST = json.loads(
+    (Path(__file__).parent / "model_manifests/flux-2-dev-bnb-4bit.json").read_text()
+)
+FLUX_2_DEV_REVISION: str = FLUX_2_DEV_MANIFEST["revision"]
 SQUARE_8K_EDGE = 8192
 MAX_SNAPSHOT_MARKER_BYTES = 65
 MAX_SNAPSHOT_JSON_BYTES = 12_000_000
@@ -198,12 +203,45 @@ def flux_2_klein_weights_available(weights_path: Path, revision: str) -> bool:
     )
 
 
+def flux_2_dev_weights_available(weights_path: Path) -> bool:
+    """Validate the frozen official topology, not a similarly named model directory.
+
+    Metadata hashes bind configs, quantization and shard indexes to the pin. Large
+    weights are size-checked here; staging must verify their manifest SHA-256 before
+    writing the existing revision marker. Health never scans 34GB of weight data.
+    """
+    marker = _read_bounded(weights_path / ".image-api-revision", MAX_SNAPSHOT_MARKER_BYTES)
+    if marker is None or marker.strip() != FLUX_2_DEV_REVISION.encode():
+        return False
+    try:
+        expected = FLUX_2_DEV_MANIFEST["files"]
+        actual_weights = {
+            str(path.relative_to(weights_path))
+            for component in ("text_encoder", "transformer", "vae")
+            for path in (weights_path / component).glob("*.safetensors*")
+        }
+        if actual_weights != {name for name in expected if ".safetensors" in name}:
+            return False
+        for name, identity in expected.items():
+            path = weights_path / name
+            if not path.is_file() or path.stat().st_size != identity["size"]:
+                return False
+            if not name.endswith(".safetensors"):
+                data = _read_bounded(path, identity["size"])
+                if data is None or hashlib.sha256(data).hexdigest() != identity["sha256"]:
+                    return False
+    except OSError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class Settings:
     ideogram_weights_path: Path
     longcat_edit_weights_path: Path
     longcat_edit_turbo_weights_path: Path
     flux_2_klein_4b_weights_path: Path
+    flux_2_dev_weights_path: Path = Path("/models/flux-2-dev-bnb-4bit")
     longcat_edit_revision: str = LONGCAT_EDIT_REVISION
     longcat_edit_turbo_revision: str = LONGCAT_EDIT_TURBO_REVISION
     flux_2_klein_4b_revision: str = FLUX_2_KLEIN_4B_REVISION
@@ -246,6 +284,9 @@ class Settings:
             ),
             flux_2_klein_4b_weights_path=Path(
                 os.getenv("IMAGE_API_FLUX_2_KLEIN_4B_WEIGHTS_PATH", "/models/flux-2-klein-4b")
+            ),
+            flux_2_dev_weights_path=Path(
+                os.getenv("IMAGE_API_FLUX_2_DEV_WEIGHTS_PATH", "/models/flux-2-dev-bnb-4bit")
             ),
             worker_timeout_seconds=float(os.getenv("IMAGE_API_WORKER_TIMEOUT_SECONDS", "900")),
             max_upload_bytes=int(os.getenv("IMAGE_API_MAX_UPLOAD_BYTES", "20000000")),
@@ -291,6 +332,7 @@ class Settings:
             longcat_edit_weights_path=root / "longcat",
             longcat_edit_turbo_weights_path=root / "longcat-turbo",
             flux_2_klein_4b_weights_path=root / "flux-2-klein-4b",
+            flux_2_dev_weights_path=root / "flux-2-dev-bnb-4bit",
             max_upload_bytes=1_000_000,
             max_request_bytes=1_001_000,
             max_input_pixels=1_000_000,

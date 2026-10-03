@@ -311,6 +311,7 @@ def test_production_composed_physical_model_layout_admits_all_configured_models(
         "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
         "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
         "flux-2-klein-4b": {"weightsAvailable": True, "loaded": False},
+        "flux-2-dev-bnb-4bit": {"weightsAvailable": False, "loaded": False},
     }
 
 
@@ -354,6 +355,7 @@ def test_official_tokenizer_json_sizes_reach_generation_readiness(monkeypatch, t
         "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
         "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
         "flux-2-klein-4b": {"weightsAvailable": True, "loaded": False},
+        "flux-2-dev-bnb-4bit": {"weightsAvailable": False, "loaded": False},
     }
 
 

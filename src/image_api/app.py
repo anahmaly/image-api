@@ -31,10 +31,12 @@ BACKGROUND_MODELS = ("bria-rmbg-2.0", "birefnet-hr-matting")
 SAMPLER_PRESETS = ("V4_QUALITY_48", "V4_DEFAULT_20", "V4_TURBO_12")
 LONGCAT_MODELS = ("longcat-image-edit", "longcat-image-edit-turbo")
 FLUX_2_KLEIN_4B = "flux-2-klein-4b"
+FLUX_2_DEV = "flux-2-dev-bnb-4bit"
+FLUX_MODELS = (FLUX_2_KLEIN_4B, FLUX_2_DEV)
 
 
 class GenerationRequest(BaseModel):
-    model: Literal["ideogram-4-nf4", "flux-2-klein-4b"] = "ideogram-4-nf4"
+    model: Literal["ideogram-4-nf4", "flux-2-klein-4b", "flux-2-dev-bnb-4bit"] = "ideogram-4-nf4"
     width: int = Field(ge=256, le=2048, multiple_of=16)
     height: int = Field(ge=256, le=2048, multiple_of=16)
     seed: int = Field(ge=0, le=2**32 - 1)
@@ -45,14 +47,14 @@ class GenerationRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_caption_mode(self) -> GenerationRequest:
-        if self.model == FLUX_2_KLEIN_4B:
+        if self.model in FLUX_MODELS:
             if (
                 self.prompt is None
                 or self.structured_caption is not None
                 or self.magic_prompt
                 or self.sampler_preset is not None
             ):
-                raise ValueError("FLUX.2 Klein requires a direct plain prompt")
+                raise ValueError("FLUX.2 requires a direct plain prompt")
             return self
         if self.sampler_preset is None:
             raise ValueError("Ideogram generation requires a sampler_preset")
@@ -167,12 +169,12 @@ def _generation_status(status: dict[str, object]) -> dict[str, object]:
         and raw_models.get(model, {}).get("weightsAvailable") is True
         if isinstance(raw_models, dict) and isinstance(raw_models.get(model), dict)
         else False
-        for model in required_models
+        for model in (*required_models, FLUX_2_DEV)
     }
     weights = (
         type(status.get("weightsAvailable")) is bool
         and status.get("weightsAvailable") is True
-        and all(model_weights.values())
+        and all(model_weights[model] for model in required_models)
     )
     ready = type(status.get("ready")) is bool and status.get("ready") is True and weights
     worker_available = (
@@ -332,9 +334,10 @@ def create_app(
                 + [
                     {
                         "capability": "generation",
-                        "model": FLUX_2_KLEIN_4B,
+                        "model": model,
                         "acceptsSourceImage": False,
                     }
+                    for model in FLUX_MODELS
                 ]
                 + [
                     {
@@ -343,7 +346,7 @@ def create_app(
                         "acceptsSourceImage": True,
                         "inputImages": 1,
                     }
-                    for model in LONGCAT_MODELS
+                    for model in (*LONGCAT_MODELS, FLUX_2_DEV)
                 ]
             )
         }
@@ -443,7 +446,7 @@ def create_app(
     @app.post("/v1/generations", response_class=Response)
     def generation(body: GenerationRequest) -> Response:
         if (
-            body.model != FLUX_2_KLEIN_4B
+            body.model not in FLUX_MODELS
             and body.prompt is not None
             and settings.magic_prompt_backend is None
         ):
@@ -466,12 +469,20 @@ def create_app(
     async def image_edit(
         file: Annotated[UploadFile, File()],
         model: Annotated[
-            Literal["longcat-image-edit", "longcat-image-edit-turbo", "flux-2-klein-4b"], Form()
+            Literal[
+                "longcat-image-edit",
+                "longcat-image-edit-turbo",
+                "flux-2-klein-4b",
+                "flux-2-dev-bnb-4bit",
+            ],
+            Form(),
         ],
         prompt: Annotated[str, Form(min_length=1, max_length=4000)],
         seed: Annotated[int, Form(ge=0, le=2**32 - 1)],
         negative_prompt: Annotated[str, Form(max_length=4000)] = "",
     ) -> Response:
+        if model == FLUX_2_DEV and negative_prompt:
+            raise HTTPException(422, "FLUX.2 dev does not support negative prompts")
         generation = _generation_status(workers.health().get("generation", {}))
         model_matrix = cast(dict[str, dict[str, bool]], generation["models"])
         if not model_matrix[model]["ready"]:

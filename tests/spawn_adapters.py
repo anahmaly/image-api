@@ -60,10 +60,10 @@ class _Flux2KleinAdapter:
 
 def build_adapters(
     settings: GenerationAdapterSettings,
-) -> tuple[_IdeogramAdapter, _LongCatAdapter, _Flux2KleinAdapter]:
+) -> tuple[_IdeogramAdapter, _LongCatAdapter, _Flux2KleinAdapter, _Flux2KleinAdapter]:
     if settings.ideogram_weights_path:
         Path(settings.ideogram_weights_path).write_text(multiprocessing.get_start_method())
-    return _IdeogramAdapter(), _LongCatAdapter(), _Flux2KleinAdapter()
+    return _IdeogramAdapter(), _LongCatAdapter(), _Flux2KleinAdapter(), _Flux2KleinAdapter()
 
 
 def settings() -> GenerationAdapterSettings:

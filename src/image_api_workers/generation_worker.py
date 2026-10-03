@@ -10,6 +10,7 @@ from fastapi.responses import Response
 
 from image_api.config import (
     Settings,
+    flux_2_dev_weights_available,
     flux_2_klein_weights_available,
     ideogram_weights_available,
     longcat_weights_available,
@@ -20,6 +21,7 @@ from image_api_workers.generation_models import (
     GenerationModels,
 )
 from image_api.workers import PeerEvictor, WorkerUnavailable
+from image_api_workers.flux2_dev import FLUX_2_DEV
 
 logging.basicConfig(level=os.getenv("IMAGE_API_LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -67,12 +69,14 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
                 settings.flux_2_klein_4b_weights_path, settings.flux_2_klein_4b_revision
             ),
         }
+        required_available = all(mounts.values())
+        mounts[FLUX_2_DEV] = flux_2_dev_weights_available(settings.flux_2_dev_weights_path)
         active_model = models.loaded_model if models.child_alive else None
         return {
-            "ready": cuda and all(mounts.values()),
+            "ready": cuda and required_available,
             "loaded": active_model is not None,
             "device": "cuda" if cuda else "unavailable",
-            "weightsAvailable": all(mounts.values()),
+            "weightsAvailable": required_available,
             "models": {
                 name: {"weightsAvailable": value, "loaded": active_model == name}
                 for name, value in mounts.items()
@@ -139,6 +143,7 @@ def main() -> None:
                 ("longcat-image-edit-turbo", str(settings.longcat_edit_turbo_weights_path)),
             ),
             flux_2_klein_4b_weights_path=str(settings.flux_2_klein_4b_weights_path),
+            flux_2_dev_weights_path=str(settings.flux_2_dev_weights_path),
             source_dir=str(Path("/tmp")),
             revisions=(
                 ("longcat-image-edit", settings.longcat_edit_revision),

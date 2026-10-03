@@ -14,6 +14,8 @@ from typing import Any, Protocol
 
 from PIL import Image
 
+from image_api_workers.flux2_dev import FLUX_2_DEV, Flux2DevModel
+
 from image_api.config import (
     FLUX_2_KLEIN_4B_REVISION,
     LONGCAT_EDIT_REVISION,
@@ -50,11 +52,12 @@ class GenerationAdapterSettings:
     flux_2_klein_4b_weights_path: str
     source_dir: str
     revisions: tuple[tuple[str, str], ...]
+    flux_2_dev_weights_path: str = "/models/flux-2-dev-bnb-4bit"
 
 
 def build_production_adapters(
     settings: GenerationAdapterSettings,
-) -> tuple[GenerationAdapter, GenerationAdapter, GenerationAdapter]:
+) -> tuple[GenerationAdapter, GenerationAdapter, GenerationAdapter, GenerationAdapter]:
     """Construct lock-owning production adapters only inside the generation child."""
     from image_api_workers.ideogram import IdeogramModel
 
@@ -66,6 +69,7 @@ def build_production_adapters(
             revisions=dict(settings.revisions),
         ),
         Flux2KleinModel(Path(settings.flux_2_klein_4b_weights_path)),
+        Flux2DevModel(Path(settings.flux_2_dev_weights_path)),
     )
 
 
@@ -337,7 +341,8 @@ def _generation_child(
     connection: object,
     settings: GenerationAdapterSettings,
     adapter_factory: Callable[
-        [GenerationAdapterSettings], tuple[GenerationAdapter, GenerationAdapter, GenerationAdapter]
+        [GenerationAdapterSettings],
+        tuple[GenerationAdapter, GenerationAdapter, GenerationAdapter, GenerationAdapter],
     ],
 ) -> None:
     """The child is the only process allowed to materialize a generation pipeline."""
@@ -345,7 +350,7 @@ def _generation_child(
 
     channel = connection
     assert isinstance(channel, Connection)
-    ideogram, longcat, flux_2_klein = adapter_factory(settings)
+    ideogram, longcat, flux_2_klein, flux_2_dev = adapter_factory(settings)
     while True:
         try:
             message = channel.recv()
@@ -360,6 +365,8 @@ def _generation_child(
             if target == "ideogram-4-nf4"
             else flux_2_klein
             if target == FLUX_2_KLEIN_4B
+            else flux_2_dev
+            if target == FLUX_2_DEV
             else longcat
         )
         try:
@@ -378,7 +385,7 @@ class GenerationModels:
         *,
         adapter_factory: Callable[
             [GenerationAdapterSettings],
-            tuple[GenerationAdapter, GenerationAdapter, GenerationAdapter],
+            tuple[GenerationAdapter, GenerationAdapter, GenerationAdapter, GenerationAdapter],
         ] = build_production_adapters,
         status_path: Path | None = None,
         lifecycle_observer: Callable[[str, str, int], None] | None = None,
@@ -421,6 +428,7 @@ class GenerationModels:
             target != "ideogram-4-nf4"
             and target not in LONGCAT_MODELS
             and target != FLUX_2_KLEIN_4B
+            and target != FLUX_2_DEV
         ):
             raise ValueError("invalid persisted generation model")
         with self._lock:

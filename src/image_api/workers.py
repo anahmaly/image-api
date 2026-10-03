@@ -149,6 +149,7 @@ class HttpWorkerClient:
                     "longcat-image-edit",
                     "longcat-image-edit-turbo",
                     "flux-2-klein-4b",
+                    "flux-2-dev-bnb-4bit",
                 }
                 result["models"] = {
                     name: {
@@ -335,6 +336,7 @@ class FakeWorkerClient:
                     "longcat-image-edit": {"weightsAvailable": True, "loaded": False},
                     "longcat-image-edit-turbo": {"weightsAvailable": True, "loaded": False},
                     "flux-2-klein-4b": {"weightsAvailable": True, "loaded": False},
+                    "flux-2-dev-bnb-4bit": {"weightsAvailable": True, "loaded": False},
                 }
             result[capability] = status
         return result
