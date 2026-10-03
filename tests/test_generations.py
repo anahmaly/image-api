@@ -130,6 +130,7 @@ def test_gateway_health_uses_configured_worker_timeout_for_generation_projection
             "longcat-image-edit": {"weightsAvailable": False, "ready": False},
             "longcat-image-edit-turbo": {"weightsAvailable": False, "ready": False},
             "flux-2-klein-4b": {"weightsAvailable": False, "ready": False},
+            "flux-2-dev-bnb-4bit": {"weightsAvailable": False, "ready": False},
         },
     }
     assert capability(corrected, "generation") == {
@@ -143,6 +144,7 @@ def test_gateway_health_uses_configured_worker_timeout_for_generation_projection
             "longcat-image-edit": {"weightsAvailable": True, "ready": True},
             "longcat-image-edit-turbo": {"weightsAvailable": True, "ready": True},
             "flux-2-klein-4b": {"weightsAvailable": True, "ready": True},
+            "flux-2-dev-bnb-4bit": {"weightsAvailable": False, "ready": False},
         },
     }
     assert capability(corrected, "upscale") == {

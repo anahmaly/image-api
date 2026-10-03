@@ -117,6 +117,7 @@ def test_generation_compose_mounts_the_existing_physical_model_roots() -> None:
     assert "IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH: /models/longcat-image-edit" in worker
     assert "IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH: /models/longcat-image-edit-turbo" in worker
     assert "IMAGE_API_FLUX_2_KLEIN_4B_WEIGHTS_PATH: /models/flux-2-klein-4b" in worker
+    assert "IMAGE_API_FLUX_2_DEV_WEIGHTS_PATH: /models/flux-2-dev-bnb-4bit" in worker
 
 
 def test_gateway_compose_healthcheck_accepts_truthful_partial_gateway_readiness() -> None:
@@ -199,7 +200,13 @@ def test_generation_install_handles_pep_668_and_keeps_ideogram_pinned() -> None:
     assert (
         "git+https://github.com/ideogram-oss/ideogram4.git@990fe1c4e950bb9e9dc90e01c0ad98ba434f83c2"
     ) in tokens
-    assert "from diffusers import Flux2KleinPipeline, LongCatImageEditPipeline" in generation
+    assert "Flux2KleinPipeline, LongCatImageEditPipeline" in generation
+    assert '"bitsandbytes==0.49.2"' in generation
+    assert "AutoencoderKLFlux2, Flux2Pipeline, Flux2Transformer2DModel" in generation
+    workflow = (ROOT / ".github/workflows/image-api.yml").read_text()
+    assert "docker build -f Dockerfile.generation" in workflow
+    assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in workflow
+    assert "RUN python tests/flux2_dev_runtime_smoke.py" in generation
     assert all(
         "--break-system-packages" not in path.read_text()
         for path in dockerfiles
