@@ -5,6 +5,7 @@ __pycache__
 *.pyc
 tests/*
 !tests/ideogram_tokenizer_compat_smoke.py
+!tests/flux2_dev_runtime_smoke.py
 models
 state
 1.png

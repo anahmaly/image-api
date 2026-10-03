@@ -207,6 +207,12 @@ def test_generation_install_handles_pep_668_and_keeps_ideogram_pinned() -> None:
     assert "docker build -f Dockerfile.generation" in workflow
     assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in workflow
     assert "RUN python tests/flux2_dev_runtime_smoke.py" in generation
+    dockerignore = (ROOT / ".dockerignore").read_text().splitlines()
+    assert "tests/*" in dockerignore
+    for source in re.findall(r"^COPY (tests/\S+) ", generation, re.MULTILINE):
+        assert (ROOT / source).is_file()
+        assert f"!{source}" in dockerignore
+        assert dockerignore.index(f"!{source}") > dockerignore.index("tests/*")
     assert all(
         "--break-system-packages" not in path.read_text()
         for path in dockerfiles
