@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import multiprocessing.connection
+import pickle
 import socket
 import sys
 import types
@@ -40,6 +41,8 @@ class HeavyBoundaries:
         self.inference_active = False
         self.calls = []
         self.cuda_available = True
+        self.expected_tiling = False
+        self.vae_operations = []
         owner = self
 
         def forbid_network(*args, **kwargs):
@@ -67,6 +70,27 @@ class HeavyBoundaries:
                 owner.events.append("vae-cuda")
                 return self
 
+        class Vae(Component):
+            use_tiling = False
+
+            def enable_tiling(self):
+                assert self.device == "cuda:0"
+                assert not self.use_tiling
+                self.use_tiling = True
+
+            def compute(self, operation):
+                assert self.device == "cuda:0" and owner.inference_active
+                assert self.use_tiling is owner.expected_tiling
+                owner.vae_operations.append((operation, self.use_tiling))
+                if owner.fail_at == operation:
+                    raise RuntimeError("fixture VAE failure")
+
+            def encode(self, image):
+                self.compute("vae-encode")
+
+            def decode(self):
+                self.compute("vae-decode")
+
         def loader(name, folder, quantized):
             class Loader:
                 @staticmethod
@@ -76,7 +100,7 @@ class HeavyBoundaries:
                     if quantized:
                         expected["device_map"] = {"": "cuda:0"}
                     assert kwargs == expected
-                    return Component(name)
+                    return Vae(name) if name == "vae" else Component(name)
 
             return Loader
 
@@ -122,6 +146,7 @@ class HeavyBoundaries:
                 }
                 assert set(owner.live) == {"transformer", "vae"}
                 assert all(component.device == "cuda:0" for component in owner.live.values())
+                assert kwargs["vae"].use_tiling is owner.expected_tiling
                 value = object.__new__(cls)
                 value.transformer, value.vae = kwargs["transformer"], kwargs["vae"]
                 return value
@@ -141,10 +166,12 @@ class HeavyBoundaries:
                 if source is not None:
                     assert source.mode == "RGB" and source.size == (width, height)
                     assert source.getpixel((0, 0)) == (10, 20, 30)
+                    self.vae.encode(source)
                 owner.calls.append((width, height, source is not None))
                 owner.events.append("denoise")
                 if owner.fail_at == "denoise":
                     raise RuntimeError("fixture denoise failure")
+                self.vae.decode()
                 # Mimic upstream packing; the public output must not be resized.
                 return types.SimpleNamespace(
                     images=[Image.new("RGB", (width // 16 * 16, height // 16 * 16))]
@@ -227,6 +254,8 @@ def inline_processes(monkeypatch):
             self.process = None
 
         def send(self, message):
+            # A real process pipe serializes the request and result.
+            message = pickle.loads(pickle.dumps(message))
             if self.process is not None:
                 if message is None:
                     self.process.alive = False
@@ -253,7 +282,16 @@ def inline_processes(monkeypatch):
         def __init__(self, *, target, args, daemon):
             assert daemon
             assert not any(process.alive for process in processes)
-            self.target, self.args = target, args
+            self.target = target
+            adapters = None
+
+            def reused_adapters(settings):
+                nonlocal adapters
+                if adapters is None:
+                    adapters = args[2](settings)
+                return adapters
+
+            self.args = (args[0], args[1], reused_adapters)
             args[0].peer.process = self
             self.alive = False
             self.joined = False

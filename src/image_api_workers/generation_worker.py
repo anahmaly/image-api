@@ -4,6 +4,7 @@ import atexit
 import logging
 import os
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response
@@ -21,6 +22,7 @@ from image_api_workers.generation_models import (
     GenerationModels,
 )
 from image_api.workers import PeerEvictor, WorkerUnavailable
+from image_api.generation_options import validate_vae_tiling
 from image_api_workers.flux2_dev import FLUX_2_DEV
 
 logging.basicConfig(level=os.getenv("IMAGE_API_LOG_LEVEL", "INFO"))
@@ -38,6 +40,10 @@ def _evict_peers() -> None:
 
 def _run_selected_model(models: GenerationModels, request: dict[str, object]) -> bytes:
     target = request.get("model")
+    try:
+        validate_vae_tiling(target, request.get("vae_tiling", False))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     if isinstance(target, str) and models.loaded_model != target:
         _evict_peers()
     return models(request)
@@ -93,6 +99,8 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
     def generate(request: dict[str, object]) -> Response:
         try:
             return Response(_run_selected_model(models, request), media_type="image/png")
+        except HTTPException:
+            raise
         except WorkerUnavailable as exc:
             raise HTTPException(503, "peer model eviction unavailable") from exc
         except Exception as exc:
@@ -106,6 +114,7 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
         prompt: str = "",
         negative_prompt: str = "",
         seed: int = 0,
+        vae_tiling: Literal["true", "false"] = "false",
     ) -> Response:
         try:
             data = await file.read()
@@ -117,11 +126,14 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
                         "prompt": prompt,
                         "negative_prompt": negative_prompt,
                         "seed": seed,
+                        "vae_tiling": vae_tiling == "true",
                         "source_image_bytes": data,
                     },
                 ),
                 media_type="image/png",
             )
+        except HTTPException:
+            raise
         except WorkerUnavailable as exc:
             raise HTTPException(503, "peer model eviction unavailable") from exc
         except Exception as exc:

@@ -18,7 +18,7 @@ from image_api.config import (
     flux_2_dev_weights_available,
 )
 from image_api.coordinator import SingleFlightCoordinator
-from image_api.workers import HttpWorkerClient, PeerEvictor
+from image_api.workers import FakeWorkerClient, HttpWorkerClient, PeerEvictor
 from image_api_workers.flux2_dev import FLUX_2_DEV, Flux2DevModel
 from image_api_workers.generation_models import GenerationAdapterSettings, GenerationModels
 from image_api_workers.generation_worker import create_worker_app
@@ -219,22 +219,33 @@ def test_public_ingress_real_worker_child_and_adapter_are_connected(
         assert coordinator.status()["active"] == 1
 
     heavy.on_encode = during_encoding
-    for _ in range(2):
-        response = gateway.post("/v1/generations", json=request())
+    for option in ({}, {"vae_tiling": True}, {"vae_tiling": False}, {}):
+        heavy.expected_tiling = option.get("vae_tiling", False)
+        response = gateway.post("/v1/generations", json=request(**option))
         assert response.status_code == 200, response.text
         assert Image.open(BytesIO(response.content)).size == (256, 272)
+        assert heavy.vae_operations[-1] == ("vae-decode", heavy.expected_tiling)
+        assert not heavy.live
     assert len(processes) == 1
     assert len(peer_calls) == 2
     assert not heavy.live
 
-    response = gateway.post(
-        "/v1/image-edits",
-        data={"model": FLUX_2_DEV, "prompt": "exact prompt", "seed": "42"},
-        files={"file": ("source.png", png("RGBA", (768, 531)), "image/png")},
-    )
-    assert response.status_code == 200, response.text
-    assert heavy.calls[-1] == (768, 531, True)
-    assert Image.open(BytesIO(response.content)).size == (768, 528)
+    for option in ({}, {"vae_tiling": "true"}, {"vae_tiling": "false"}, {}):
+        heavy.expected_tiling = option.get("vae_tiling") == "true"
+        response = gateway.post(
+            "/v1/image-edits",
+            data={"model": FLUX_2_DEV, "prompt": "exact prompt", "seed": "42"} | option,
+            files={"file": ("source.png", png("RGBA", (768, 531)), "image/png")},
+        )
+        assert response.status_code == 200, response.text
+        assert heavy.calls[-1] == (768, 531, True)
+        assert heavy.vae_operations[-2:] == [
+            ("vae-encode", heavy.expected_tiling),
+            ("vae-decode", heavy.expected_tiling),
+        ]
+        assert Image.open(BytesIO(response.content)).size == (768, 528)
+        assert not heavy.live
+    assert len(processes) == 1
     assert coordinator.status()["active"] == 0
 
     # Distinct selection still follows the unchanged child exit/reap boundary.
@@ -250,12 +261,17 @@ def test_public_ingress_real_worker_child_and_adapter_are_connected(
     assert "existing-klein-offload" in heavy.events
 
     # Failure crosses the real child error result and reaps before next load.
-    heavy.fail_at = "denoise"
-    assert gateway.post("/v1/generations", json=request()).status_code == 502
+    heavy.fail_at = "vae-decode"
+    heavy.expected_tiling = True
+    assert gateway.post("/v1/generations", json=request(vae_tiling=True)).status_code == 502
     assert not models.child_alive and not heavy.live
     assert coordinator.status()["active"] == 0
     heavy.fail_at = None
+    heavy.expected_tiling = False
     assert gateway.post("/v1/generations", json=request()).status_code == 200
+    models.unload()
+    assert gateway.post("/v1/generations", json=request(vae_tiling=False)).status_code == 200
+    assert heavy.vae_operations[-1] == ("vae-decode", False)
     models.unload()
     assert all(process.joined for process in processes)
     assert not heavy.live
@@ -286,3 +302,107 @@ def test_public_ingress_real_worker_child_and_adapter_are_connected(
         ).status_code
         == 422
     )
+
+
+def test_reused_adapter_tiling_cleanup_after_reference_failure(prepared):
+    root, heavy = prepared
+    adapter = Flux2DevModel(root)
+    source = png("RGB", (768, 528))
+    heavy.expected_tiling = True
+    heavy.fail_at = "vae-encode"
+    with pytest.raises(RuntimeError, match="generation failed"):
+        adapter(request(vae_tiling=True, source_image_bytes=source))
+    assert not heavy.live
+    adapter.unload()
+    heavy.fail_at = None
+    heavy.expected_tiling = False
+    assert adapter(request(source_image_bytes=source)).startswith(b"\x89PNG")
+    assert heavy.vae_operations[-2:] == [("vae-encode", False), ("vae-decode", False)]
+    assert not heavy.live
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, 0, None, [], {}])
+def test_vae_tiling_json_types_rejected_before_dispatch(tmp_path, prepared, value):
+    root, heavy = prepared
+    workers = FakeWorkerClient()
+    gateway = TestClient(create_app(settings=Settings.for_tests(tmp_path), workers=workers))
+    assert gateway.post("/v1/generations", json=request(vae_tiling=value)).status_code == 422
+    assert workers.model_invocations == 0
+    with pytest.raises(ValueError, match="vae_tiling must be a boolean"):
+        Flux2DevModel(root)(request(vae_tiling=value))
+    assert not heavy.events
+
+
+@pytest.mark.parametrize("value", ["True", "False", "1", "0", "yes", "null", ""])
+def test_vae_tiling_form_literals_rejected_before_dispatch(tmp_path, value):
+    workers = FakeWorkerClient()
+    gateway = TestClient(create_app(settings=Settings.for_tests(tmp_path), workers=workers))
+    response = gateway.post(
+        "/v1/image-edits",
+        data={"model": FLUX_2_DEV, "prompt": "exact prompt", "seed": "42", "vae_tiling": value},
+        files={"file": ("source.png", png(), "image/png")},
+    )
+    assert response.status_code == 422
+    assert workers.model_invocations == 0
+
+
+@pytest.mark.parametrize(
+    "route,model",
+    [
+        ("generations", "ideogram-4-nf4"),
+        ("generations", "flux-2-klein-4b"),
+        ("image-edits", "flux-2-klein-4b"),
+        ("image-edits", "longcat-image-edit"),
+        ("image-edits", "longcat-image-edit-turbo"),
+    ],
+)
+def test_vae_tiling_eligibility_preserves_other_models(tmp_path, route, model):
+    workers = FakeWorkerClient()
+    gateway = TestClient(create_app(settings=Settings.for_tests(tmp_path), workers=workers))
+    for enabled, status in ((True, 422), (False, 200), (None, 200)):
+        if route == "generations":
+            payload = request(model=model)
+            if model == "ideogram-4-nf4":
+                payload.pop("prompt")
+                payload.update(
+                    structured_caption={"description": "test"}, sampler_preset="V4_DEFAULT_20"
+                )
+            if enabled is not None:
+                payload["vae_tiling"] = enabled
+            response = gateway.post("/v1/generations", json=payload)
+        else:
+            form = {"model": model, "prompt": "exact prompt", "seed": "42"}
+            if enabled is not None:
+                form["vae_tiling"] = "true" if enabled else "false"
+            response = gateway.post(
+                "/v1/image-edits",
+                data=form,
+                files={"file": ("source.png", png(), "image/png")},
+            )
+        assert response.status_code == status, response.text
+        if enabled:
+            assert workers.model_invocations == 0
+    assert workers.model_invocations == 2
+
+
+def test_worker_rejects_invalid_tiling_before_peers_or_model_loading(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid option must not dispatch or evict peers")
+
+    monkeypatch.setattr("image_api_workers.generation_worker._evict_peers", forbidden)
+    models = GenerationModels(GenerationAdapterSettings("", (), "", "", ()))
+    worker = TestClient(create_worker_app(models, Settings.for_tests(tmp_path)))
+    for option in (
+        {"vae_tiling": "true"},
+        {"vae_tiling": None},
+        {"model": "flux-2-klein-4b", "vae_tiling": True},
+    ):
+        assert worker.post("/internal/generate", json=request(**option)).status_code == 422
+    for model, value in ((FLUX_2_DEV, "1"), ("longcat-image-edit", "true")):
+        response = worker.post(
+            "/internal/image-edit",
+            params={"model": model, "vae_tiling": value},
+            files={"file": ("source.png", png(), "image/png")},
+        )
+        assert response.status_code == 422
+    assert not models.child_alive
