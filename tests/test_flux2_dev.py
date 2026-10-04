@@ -219,26 +219,43 @@ def test_public_ingress_real_worker_child_and_adapter_are_connected(
         assert coordinator.status()["active"] == 1
 
     heavy.on_encode = during_encoding
-    for option in ({}, {"vae_tiling": True}, {"vae_tiling": False}, {}):
+    options = (
+        {},
+        {"num_inference_steps": 25, "vae_tiling": True},
+        {"num_inference_steps": 50, "vae_tiling": False},
+        {"num_inference_steps": 1, "vae_tiling": True},
+        {"num_inference_steps": 37},
+        {},
+    )
+    for option in options:
         heavy.expected_tiling = option.get("vae_tiling", False)
+        heavy.expected_steps = option.get("num_inference_steps", 25)
         response = gateway.post("/v1/generations", json=request(**option))
         assert response.status_code == 200, response.text
         assert Image.open(BytesIO(response.content)).size == (256, 272)
         assert heavy.vae_operations[-1] == ("vae-decode", heavy.expected_tiling)
+        assert heavy.steps[-1] == heavy.expected_steps
         assert not heavy.live
     assert len(processes) == 1
     assert len(peer_calls) == 2
     assert not heavy.live
 
-    for option in ({}, {"vae_tiling": "true"}, {"vae_tiling": "false"}, {}):
-        heavy.expected_tiling = option.get("vae_tiling") == "true"
+    assert heavy.steps == [25, 25, 50, 1, 37, 25]
+    for option in options:
+        heavy.expected_tiling = option.get("vae_tiling", False)
+        heavy.expected_steps = option.get("num_inference_steps", 25)
+        form_options = {
+            name: str(value).lower() if type(value) is bool else str(value)
+            for name, value in option.items()
+        }
         response = gateway.post(
             "/v1/image-edits",
-            data={"model": FLUX_2_DEV, "prompt": "exact prompt", "seed": "42"} | option,
+            data={"model": FLUX_2_DEV, "prompt": "exact prompt", "seed": "42"} | form_options,
             files={"file": ("source.png", png("RGBA", (768, 531)), "image/png")},
         )
         assert response.status_code == 200, response.text
         assert heavy.calls[-1] == (768, 531, True)
+        assert heavy.steps[-1] == heavy.expected_steps
         assert heavy.vae_operations[-2:] == [
             ("vae-encode", heavy.expected_tiling),
             ("vae-decode", heavy.expected_tiling),
@@ -246,6 +263,7 @@ def test_public_ingress_real_worker_child_and_adapter_are_connected(
         assert Image.open(BytesIO(response.content)).size == (768, 528)
         assert not heavy.live
     assert len(processes) == 1
+    assert heavy.steps == [25, 25, 50, 1, 37, 25] * 2
     assert coordinator.status()["active"] == 0
 
     # Distinct selection still follows the unchanged child exit/reap boundary.
@@ -263,11 +281,18 @@ def test_public_ingress_real_worker_child_and_adapter_are_connected(
     # Failure crosses the real child error result and reaps before next load.
     heavy.fail_at = "vae-decode"
     heavy.expected_tiling = True
-    assert gateway.post("/v1/generations", json=request(vae_tiling=True)).status_code == 502
+    heavy.expected_steps = 50
+    assert (
+        gateway.post(
+            "/v1/generations", json=request(vae_tiling=True, num_inference_steps=50)
+        ).status_code
+        == 502
+    )
     assert not models.child_alive and not heavy.live
     assert coordinator.status()["active"] == 0
     heavy.fail_at = None
     heavy.expected_tiling = False
+    heavy.expected_steps = 25
     assert gateway.post("/v1/generations", json=request()).status_code == 200
     models.unload()
     assert gateway.post("/v1/generations", json=request(vae_tiling=False)).status_code == 200
@@ -309,13 +334,15 @@ def test_reused_adapter_tiling_cleanup_after_reference_failure(prepared):
     adapter = Flux2DevModel(root)
     source = png("RGB", (768, 528))
     heavy.expected_tiling = True
+    heavy.expected_steps = 50
     heavy.fail_at = "vae-encode"
     with pytest.raises(RuntimeError, match="generation failed"):
-        adapter(request(vae_tiling=True, source_image_bytes=source))
+        adapter(request(vae_tiling=True, num_inference_steps=50, source_image_bytes=source))
     assert not heavy.live
     adapter.unload()
     heavy.fail_at = None
     heavy.expected_tiling = False
+    heavy.expected_steps = 25
     assert adapter(request(source_image_bytes=source)).startswith(b"\x89PNG")
     assert heavy.vae_operations[-2:] == [("vae-encode", False), ("vae-decode", False)]
     assert not heavy.live
@@ -405,4 +432,125 @@ def test_worker_rejects_invalid_tiling_before_peers_or_model_loading(tmp_path, m
             files={"file": ("source.png", png(), "image/png")},
         )
         assert response.status_code == 422
+    assert not models.child_alive
+
+
+@pytest.mark.parametrize("value", [True, False, 25.0, 1.5, "25", None, 0, -1, 51, 4096, [], {}])
+def test_inference_steps_json_rejected_at_gateway_worker_and_adapter(
+    tmp_path, prepared, monkeypatch, value
+):
+    root, heavy = prepared
+    workers = FakeWorkerClient()
+    settings = Settings.for_tests(tmp_path)
+    gateway = TestClient(create_app(settings=settings, workers=workers))
+
+    def forbidden():
+        raise AssertionError("invalid steps must not evict peers")
+
+    monkeypatch.setattr("image_api_workers.generation_worker._evict_peers", forbidden)
+    models = GenerationModels(GenerationAdapterSettings("", (), "", "", ()))
+    worker = TestClient(create_worker_app(models, settings))
+    payload = request(num_inference_steps=value)
+    assert gateway.post("/v1/generations", json=payload).status_code == 422
+    assert worker.post("/internal/generate", json=payload).status_code == 422
+    with pytest.raises(ValueError, match="num_inference_steps"):
+        Flux2DevModel(root)(payload)
+    assert workers.model_invocations == 0
+    assert not models.child_alive and not heavy.events
+
+
+@pytest.mark.parametrize(
+    "value", ["true", "false", "25.0", "1.5", "null", "", "0", "-1", "51", "4096", "+25", " 25 "]
+)
+def test_inference_steps_text_rejected_at_public_form_and_worker_query(
+    tmp_path, monkeypatch, value
+):
+    workers = FakeWorkerClient()
+    settings = Settings.for_tests(tmp_path)
+    gateway = TestClient(create_app(settings=settings, workers=workers))
+
+    def forbidden():
+        raise AssertionError("invalid steps must not evict peers")
+
+    monkeypatch.setattr("image_api_workers.generation_worker._evict_peers", forbidden)
+    models = GenerationModels(GenerationAdapterSettings("", (), "", "", ()))
+    worker = TestClient(create_worker_app(models, settings))
+    parameters = {
+        "model": FLUX_2_DEV,
+        "prompt": "exact prompt",
+        "seed": "42",
+        "num_inference_steps": value,
+    }
+    for client, route, transport in (
+        (gateway, "/v1/image-edits", "data"),
+        (worker, "/internal/image-edit", "params"),
+    ):
+        response = client.post(
+            route,
+            **{transport: parameters},
+            files={"file": ("source.png", png(), "image/png")},
+        )
+        assert response.status_code == 422, response.text
+    assert workers.model_invocations == 0
+    assert not models.child_alive
+
+
+@pytest.mark.parametrize(
+    "route,model",
+    [
+        ("generations", "ideogram-4-nf4"),
+        ("generations", "flux-2-klein-4b"),
+        ("image-edits", "flux-2-klein-4b"),
+        ("image-edits", "longcat-image-edit"),
+        ("image-edits", "longcat-image-edit-turbo"),
+    ],
+)
+def test_inference_steps_reject_unsupported_models_without_changing_omission(
+    tmp_path, monkeypatch, route, model
+):
+    workers = FakeWorkerClient()
+    settings = Settings.for_tests(tmp_path)
+    gateway = TestClient(create_app(settings=settings, workers=workers))
+
+    def forbidden():
+        raise AssertionError("unsupported steps must not evict peers")
+
+    monkeypatch.setattr("image_api_workers.generation_worker._evict_peers", forbidden)
+    models = GenerationModels(GenerationAdapterSettings("", (), "", "", ()))
+    worker = TestClient(create_worker_app(models, settings))
+    for explicit, expected in ((True, 422), (False, 200)):
+        payload = request(model=model)
+        if model == "ideogram-4-nf4":
+            payload.pop("prompt")
+            payload.update(
+                structured_caption={"description": "test"}, sampler_preset="V4_DEFAULT_20"
+            )
+        if explicit:
+            payload["num_inference_steps"] = 25
+        if route == "generations":
+            response = gateway.post("/v1/generations", json=payload)
+            if explicit:
+                assert worker.post("/internal/generate", json=payload).status_code == 422
+        else:
+            form = {"model": model, "prompt": "exact prompt", "seed": "42"}
+            if explicit:
+                form["num_inference_steps"] = "25"
+            response = gateway.post(
+                "/v1/image-edits",
+                data=form,
+                files={"file": ("source.png", png(), "image/png")},
+            )
+            if explicit:
+                assert (
+                    worker.post(
+                        "/internal/image-edit",
+                        params=form,
+                        files={"file": ("source.png", png(), "image/png")},
+                    ).status_code
+                    == 422
+                )
+        assert response.status_code == expected, response.text
+        if explicit:
+            assert workers.model_invocations == 0
+    assert workers.model_invocations == 1
     assert not models.child_alive

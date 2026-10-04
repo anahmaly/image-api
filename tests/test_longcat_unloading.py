@@ -92,6 +92,7 @@ def test_flux_2_klein_forwards_exact_prompt_and_source_as_rgb(tmp_path) -> None:
     call = next(event for event in events if isinstance(event, dict))
     assert call["prompt"] == "exact edit prompt"
     assert call["generator"] == ("cuda", 43)
+    assert "num_inference_steps" not in call  # Preserve the pinned edit pipeline default.
     assert isinstance(call["image"], Image.Image)
     assert call["image"].mode == "RGB"
     with Image.open(BytesIO(output)) as image:

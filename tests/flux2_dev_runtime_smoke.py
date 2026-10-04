@@ -19,9 +19,15 @@ assert {"scheduler", "vae", "text_encoder", "tokenizer", "transformer"} <= set(
     signature(Flux2Pipeline.__init__).parameters
 )
 assert {"prompt", "device"} <= set(signature(Flux2Pipeline.encode_prompt).parameters)
-assert {"image", "prompt_embeds", "width", "height", "caption_upsample_temperature"} <= set(
-    signature(Flux2Pipeline.__call__).parameters
-)
+assert {
+    "image",
+    "prompt_embeds",
+    "width",
+    "height",
+    "caption_upsample_temperature",
+    "num_inference_steps",
+} <= set(signature(Flux2Pipeline.__call__).parameters)
+assert signature(Flux2Pipeline.__call__).parameters["num_inference_steps"].default == 50
 assert callable(AutoProcessor.from_pretrained)
 assert callable(Mistral3ForConditionalGeneration.from_pretrained)
 assert callable(Flux2Transformer2DModel.from_pretrained)
