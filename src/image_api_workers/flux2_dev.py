@@ -11,7 +11,7 @@ from typing import Any, cast
 from PIL import Image
 
 from image_api.config import flux_2_dev_weights_available
-from image_api.generation_options import validate_vae_tiling
+from image_api.generation_options import resolve_num_inference_steps, validate_vae_tiling
 
 logger = logging.getLogger(__name__)
 FLUX_2_DEV = "flux-2-dev-bnb-4bit"
@@ -105,7 +105,6 @@ class Flux2DevModel:
                     pipeline(
                         prompt_embeds=embeddings,
                         caption_upsample_temperature=0,
-                        num_inference_steps=50,
                         guidance_scale=4.0,
                         num_images_per_prompt=1,
                         **parameters,
@@ -124,13 +123,14 @@ class Flux2DevModel:
             if request.get("model") != FLUX_2_DEV:
                 raise ValueError("invalid FLUX.2 dev model")
             vae_tiling = validate_vae_tiling(FLUX_2_DEV, request.get("vae_tiling", False))
+            steps = resolve_num_inference_steps(FLUX_2_DEV, request)
             if not isinstance(prompt, str) or not 1 <= len(prompt) <= 4000:
                 raise ValueError("invalid FLUX.2 dev prompt")
             if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
                 raise ValueError("invalid FLUX.2 dev seed")
             if request.get("negative_prompt"):
                 raise ValueError("FLUX.2 dev does not support negative prompts")
-            parameters: dict[str, Any] = {}
+            parameters: dict[str, Any] = {"num_inference_steps": steps}
             source = request.get("source_image_bytes")
             if isinstance(source, bytes):
                 with Image.open(BytesIO(source)) as opened:

@@ -47,7 +47,32 @@ structured captions or sampler presets. `/v1/image-edits` accepts the same model
 adapter converts the source to RGB and passes its exact dimensions to FLUX.2.
 Upstream reference preprocessing (area limit and latent-grid alignment) remains
 in the pinned pipeline; produced PNG dimensions pass through unchanged. Both paths
-use 50 steps, guidance 4.0, one output and no caption upsampling.
+use guidance 4.0, one output and no caption upsampling.
+
+Both routes accept optional `num_inference_steps` for `flux-2-dev-bnb-4bit` only.
+Omission uses **25**; explicitly supplying **50** retains the previous step
+setting. The inclusive range is **1–50**: positive custom iteration counts are
+allowed, while the cap keeps the existing 50-step denoising work ceiling rather
+than increasing the single-flight service's per-request work budget. This is an
+API policy, not a measured latency bound or an upstream model maximum. The
+[pinned pipeline](https://github.com/huggingface/diffusers/blob/236e5dd9f38e21ae40c002539368b9be9a5e0fc8/src/diffusers/pipelines/flux2/pipeline_flux2.py)
+accepts this integer parameter and defaults upstream to 50.
+
+At `/v1/generations`, use a JSON integer, e.g. `"num_inference_steps": 25`.
+At `/v1/image-edits`, use a multipart decimal-digit text field, e.g.
+`num_inference_steps=50`. Booleans, fractions (including `25.0`), signs,
+whitespace, null, blank fields, zero, negative and out-of-range values are
+rejected with 422; JSON numeric strings are also rejected. Supplying the field
+for Klein, Ideogram or either LongCat model is rejected with 422, not ignored.
+Their omitted defaults remain unchanged: Klein uses its distilled 4-step path,
+LongCat standard/Turbo use 50/8, and Ideogram keeps its named sampler presets.
+
+Steps and `vae_tiling` can be selected independently per request. Seeds, guidance,
+dimensions, GPU-only staging and cleanup are unchanged. Fewer denoising iterations
+can reduce denoising time but may reduce quality; very low counts may be unsuitable
+for this non-distilled model. Encoder/VAE work remains, so halving steps does not
+promise half the total latency. No live timing, quality or memory benchmark is
+claimed; any 25-versus-50 comparison requires separate authorization.
 
 Both routes accept optional `vae_tiling`, defaulting to false. On
 `/v1/generations`, supply a JSON boolean (`"vae_tiling": true`); strings, numbers

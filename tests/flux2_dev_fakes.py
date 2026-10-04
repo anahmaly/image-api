@@ -42,6 +42,8 @@ class HeavyBoundaries:
         self.calls = []
         self.cuda_available = True
         self.expected_tiling = False
+        self.expected_steps = 25
+        self.steps = []
         self.vae_operations = []
         owner = self
 
@@ -156,7 +158,9 @@ class HeavyBoundaries:
                 assert set(owner.live) == {"transformer", "vae"}
                 assert kwargs.pop("prompt_embeds").device == "cuda:0"
                 assert kwargs.pop("caption_upsample_temperature") == 0
-                assert kwargs.pop("num_inference_steps") == 50
+                steps = kwargs.pop("num_inference_steps")
+                assert type(steps) is int and steps == owner.expected_steps
+                owner.steps.append(steps)
                 assert kwargs.pop("guidance_scale") == 4.0
                 assert kwargs.pop("num_images_per_prompt") == 1
                 assert kwargs.pop("generator") == ("cuda:0", 42)
@@ -189,6 +193,8 @@ class HeavyBoundaries:
                 owner.events.append("existing-klein-offload")
 
             def __call__(self, **kwargs):
+                assert kwargs["num_inference_steps"] == 4
+                assert kwargs["guidance_scale"] == 1.0
                 return types.SimpleNamespace(
                     images=[Image.new("RGB", (kwargs["width"], kwargs["height"]))]
                 )

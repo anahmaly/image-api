@@ -22,7 +22,11 @@ from image_api_workers.generation_models import (
     GenerationModels,
 )
 from image_api.workers import PeerEvictor, WorkerUnavailable
-from image_api.generation_options import validate_vae_tiling
+from image_api.generation_options import (
+    parse_num_inference_steps,
+    resolve_num_inference_steps,
+    validate_vae_tiling,
+)
 from image_api_workers.flux2_dev import FLUX_2_DEV
 
 logging.basicConfig(level=os.getenv("IMAGE_API_LOG_LEVEL", "INFO"))
@@ -42,10 +46,13 @@ def _run_selected_model(models: GenerationModels, request: dict[str, object]) ->
     target = request.get("model")
     try:
         validate_vae_tiling(target, request.get("vae_tiling", False))
+        steps = resolve_num_inference_steps(target, request)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     if isinstance(target, str) and models.loaded_model != target:
         _evict_peers()
+    if steps is not None:
+        request = request | {"num_inference_steps": steps}
     return models(request)
 
 
@@ -115,8 +122,13 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
         negative_prompt: str = "",
         seed: int = 0,
         vae_tiling: Literal["true", "false"] = "false",
+        num_inference_steps: str | None = None,
     ) -> Response:
         try:
+            try:
+                steps = parse_num_inference_steps(model, num_inference_steps)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
             data = await file.read()
             return Response(
                 _run_selected_model(
@@ -128,6 +140,7 @@ def create_worker_app(models: GenerationModels, settings: Settings) -> FastAPI:
                         "seed": seed,
                         "vae_tiling": vae_tiling == "true",
                         "source_image_bytes": data,
+                        **({"num_inference_steps": steps} if steps is not None else {}),
                     },
                 ),
                 media_type="image/png",

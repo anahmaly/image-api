@@ -7,11 +7,17 @@ from typing import Annotated, Any, BinaryIO, Literal, cast
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field, StrictBool, model_validator
+from pydantic import BaseModel, Field, StrictBool, StrictInt, model_validator
 
 from image_api.config import Settings
 from image_api.coordinator import CoordinatorBusy, SingleFlightCoordinator
-from image_api.generation_options import validate_vae_tiling
+from image_api.generation_options import (
+    MAX_INFERENCE_STEPS,
+    MIN_INFERENCE_STEPS,
+    parse_num_inference_steps,
+    resolve_num_inference_steps,
+    validate_vae_tiling,
+)
 from image_api.images import (
     ImageTooLarge,
     InvalidImage,
@@ -46,10 +52,19 @@ class GenerationRequest(BaseModel):
     prompt: str | None = Field(default=None, min_length=1, max_length=4000)
     magic_prompt: bool = False
     vae_tiling: StrictBool = False
+    num_inference_steps: StrictInt | None = Field(
+        default=None,
+        ge=MIN_INFERENCE_STEPS,
+        le=MAX_INFERENCE_STEPS,
+        description="FLUX.2 dev bnb4bit only; omission uses 25. Explicit null is invalid.",
+    )
 
     @model_validator(mode="after")
     def validate_caption_mode(self) -> GenerationRequest:
         validate_vae_tiling(self.model, self.vae_tiling)
+        self.num_inference_steps = resolve_num_inference_steps(
+            self.model, self.model_dump(exclude_unset=True)
+        )
         if self.model in FLUX_MODELS:
             if (
                 self.prompt is None
@@ -485,6 +500,9 @@ def create_app(
         seed: Annotated[int, Form(ge=0, le=2**32 - 1)],
         negative_prompt: Annotated[str, Form(max_length=4000)] = "",
         vae_tiling: Annotated[Literal["true", "false"], Form()] = "false",
+        num_inference_steps: Annotated[
+            str | None, Form(description="FLUX.2 dev bnb4bit only: integer 1–50; default 25")
+        ] = None,
     ) -> Response:
         # FastAPI substitutes form defaults for empty strings; an explicitly
         # empty option is invalid, not an omitted default-off request.
@@ -492,6 +510,9 @@ def create_app(
             raise HTTPException(422, "vae_tiling must be true or false")
         try:
             tiling = validate_vae_tiling(model, vae_tiling == "true")
+            steps = parse_num_inference_steps(
+                model, (await request.form()).get("num_inference_steps")
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         if model == FLUX_2_DEV and negative_prompt:
@@ -518,6 +539,7 @@ def create_app(
                     negative_prompt=negative_prompt,
                     seed=seed,
                     vae_tiling="true" if tiling else "false",
+                    **({"num_inference_steps": steps} if steps is not None else {}),
                 )
             )
         )

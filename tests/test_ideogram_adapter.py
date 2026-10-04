@@ -71,6 +71,7 @@ def test_structured_caption_runs_offline_from_mounted_weights(tmp_path, monkeypa
         pipeline.calls[0][0]
         == '{"style":{"lighting":"soft","palette":"warm"},"description":"a bee"}'
     )
+    assert pipeline.calls[0][1]["num_steps"] == 20
     with Image.open(BytesIO(encoded)) as image:
         assert image.size == (256, 512)
 
